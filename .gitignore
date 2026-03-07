@@ -1,5 +1,4 @@
 .claude
 bin
-gpu_server.py
-query_router.py
-search_app.py
+*.csv
+__pycache__
