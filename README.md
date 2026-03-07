@@ -4,16 +4,13 @@ A Modal example demonstrating video embedding and semantic search — find video
 
 ## Concept
 
-This project showcases two flavors of video retrieval:
-
-- **Video Retrieval (V-RET):** Cross-modal search across a corpus of videos. Given a text query like "zebra runs across a plain", find the best matching clip from a large collection.
-- **Moment Retrieval (M-RET):** Intra-video search. Given a text query (and optionally a reference video clip), find the best matching segments within a single longer video.
+This project showcases video retrieval, specifically cross-modal search across a corpus of videos: given a text query, find the best matching video from a large collection.
 
 Both tasks are benchmarked on [MMEB (Massive Multimodal Embedding Benchmark)](https://huggingface.co/spaces/TIGER-Lab/MMEB-Leaderboard).
 
 ## Model
 
-The primary model is **Qwen3-VL-Embedding-8B** (released January 2026), currently ranked #1 on MMEB for M-RET and #2 for V-RET. It represents a significant leap over earlier video embedding models — roughly 20 points ahead of the prior generation (e.g. VLM2Vec, released July 2025) on both tasks.
+The model powering our search is **Qwen3-VL-Embedding-8B** (released January 2026), currently ranked #1 on MMEB for M-RET and #2 for V-RET. It represents a significant leap over earlier video embedding models — roughly 20 points ahead of the prior generation (e.g. VLM2Vec, released July 2025) on both tasks.
 
 **Qwen3-VL-Embedding-2B** is also a strong option: only 3–5 points lower on M/V-RET benchmarks, but substantially smaller and faster — a good trade-off for demo-scale workloads.
 
