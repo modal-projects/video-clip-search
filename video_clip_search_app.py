@@ -40,8 +40,10 @@ vllm_image = (
         "vllm==0.16.0",
         "huggingface-hub==0.36.0",
         "qwen-vl-utils==0.0.14",
-        "torchcodec==0.9.0",
         "fastapi",
+    )
+    .run_commands(
+        "pip install torchcodec==0.9.0 --index-url https://download.pytorch.org/whl/cu126"
     )
     .env(
         {
@@ -109,11 +111,17 @@ def prepare_vllm_inputs(
         conversation, tokenize=False, add_generation_prompt=True
     )
 
+    t0 = time.time()
     _, video_inputs, video_kwargs = process_vision_info(
         conversation,
         image_patch_size=16,
         return_video_kwargs=True,
         return_video_metadata=True,
+    )
+    process_vision_ms = (time.time() - t0) * 1000
+    input_type = "video" if "video" in input_dict else "text"
+    logger.info(
+        f"process_vision_info: {process_vision_ms:.1f}ms (input_type={input_type})"
     )
 
     mm_data = {}
@@ -185,6 +193,10 @@ class EmbeddingServer:
 
         @self.web_app.post("/v1/embeddings")
         def create_embeddings(request: EmbedRequest):
+            n_inputs = len(request.inputs)
+            t_call_start = time.time()
+
+            t_prepare_start = time.time()
             vllm_inputs = [
                 prepare_vllm_inputs(
                     inp.model_dump(exclude_none=True),
@@ -193,8 +205,19 @@ class EmbeddingServer:
                 )
                 for inp in request.inputs
             ]
+            prepare_ms = (time.time() - t_prepare_start) * 1000
 
+            t_embed_start = time.time()
             outputs = self.llm.embed(vllm_inputs)
+            embed_ms = (time.time() - t_embed_start) * 1000
+
+            total_ms = (time.time() - t_call_start) * 1000
+            logger.info(
+                f"Embedding call: n_inputs={n_inputs} "
+                f"prepare={prepare_ms:.1f}ms "
+                f"embed={embed_ms:.1f}ms "
+                f"total={total_ms:.1f}ms"
+            )
 
             return {
                 "object": "list",
