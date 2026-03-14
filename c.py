@@ -35,7 +35,17 @@ text_response = requests.post(
     f"{VLLM_URL}/v1/embeddings",
     json={
         "model": "Qwen/Qwen3-VL-Embedding-8B",
-        "input": [{"type": "text", "text": "A robin sits on a tree branch in the woods"}],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "A robin sits on a tree branch in the woods",
+                    }
+                ],
+            }
+        ],
         "encoding_format": "float",
     },
 )
