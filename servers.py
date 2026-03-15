@@ -1,6 +1,8 @@
 import logging
 
 import modal
+import requests
+import time
 
 
 logger = logging.getLogger(__name__)
@@ -10,10 +12,6 @@ app = modal.App("video-clip-search-servers")
 MODEL_NAME = "Qwen/Qwen3-VL-Embedding-8B"
 MINUTES = 60
 EMBEDDING_STORE_DIR = "/root/embeddings"
-
-EMBED_URL = (
-    "https://modal-labs-adamkelch-dev--video-clip-search-servers-embe-134493.modal.run"
-)
 
 
 # --- Images ---
@@ -28,12 +26,13 @@ vllm_image = (
         "qwen-vl-utils==0.0.14",
         "torchcodec==0.9.0",
         "fastapi",
+        "pandas",
+        "requests",
+        "numpy",
+        "pyarrow",
+        "cupy-cuda12x==14.0.0",
     )
     .env({"HF_XET_HIGH_PERFORMANCE": "1", "FORCE_QWENVL_VIDEO_READER": "torchcodec"})
-)
-
-query_router_image = modal.Image.debian_slim().uv_pip_install(
-    "fastapi", "requests", "numpy", "pandas", "pyarrow"
 )
 
 # --- Volumes ---
@@ -49,36 +48,77 @@ embedding_store_vol = modal.Volume.from_name(
 # ---------------------------------------------------------------------------
 
 VLLM_PORT = 8000
-VLLM_MAX_MODEL_LEN = 4096 * 2
+VLLM_MAX_MODEL_LEN = 4096 * 10
+INSTRUCTION = "Represent the user's input description of a dance move."
+
+
+def wait_for_vllm_server():
+    for _ in range(300):  # up to ~5 minutes
+        try:
+            r = requests.get(f"http://localhost:{VLLM_PORT}/health")
+            if r.status_code == 200:
+                print("vLLM server is ready")
+                return
+            print(f"vLLM server returned {r.status_code}, retrying...")
+        except requests.ConnectionError:
+            pass
+        time.sleep(1)
+    raise RuntimeError("vLLM server failed to start")
 
 
 @app.function(
-    gpu=["A100", "A100-80GB", "H100"],
+    gpu=["L40S", "A100", "A100-80GB", "H100"],
     image=vllm_image,
     volumes={
         "/root/.cache/huggingface": hf_cache_vol,
         "/root/.cache/vllm": vllm_cache_vol,
+        EMBEDDING_STORE_DIR: embedding_store_vol,
     },
     timeout=10 * MINUTES,
     scaledown_window=15 * MINUTES,
     min_containers=1,
     max_containers=5,
 )
-@modal.web_server(port=VLLM_PORT, startup_timeout=300)
-def embedding_server():
-    """Run vLLM OpenAI-compatible embedding server. Clients use /v1/embeddings with
-    body: {"model": MODEL_NAME, "input": [{"type": "text", "text": "..."}]}
-    or {"type": "video_url", "video_url": {"url": "https://..."}}
+@modal.concurrent(max_inputs=10)
+@modal.asgi_app()
+def video_search_server():
+    """Serves a /search endpoint backed by vLLM embeddings.
+
+    Clients POST {"text": "..."} and receive {"url": "...", "score": float}.
+    Embeddings are loaded from parquet files in EMBEDDING_STORE_DIR on startup.
     """
+    import glob
+    import time
+    import os
+    import re
     import subprocess
 
+    import pandas as pd
+    import cupy as cp
+    import requests
+    from fastapi import FastAPI, Request, HTTPException
+    from fastapi.responses import JSONResponse
+
+    print("Loading embeddings")
+    parquet_files = glob.glob(os.path.join(EMBEDDING_STORE_DIR, "embeddings_*.parquet"))
+
+    if len(parquet_files) == 0:
+        raise ValueError("No embeddings found in store")
+
+    parquet_files.sort(
+        key=lambda p: int(re.search(r"embeddings_(\d+)\.parquet", p).group(1))
+    )
+    df = pd.concat([pd.read_parquet(f) for f in parquet_files], ignore_index=True)
+    logger.info(f"Loaded {len(df)} embeddings from store")
+    embedding_matrix = cp.array(df["embedding"].tolist())
+    embedding_urls = df["url"].tolist()
+
+    print("Starting vLLM server")
     subprocess.Popen(
         [
             "vllm",
             "serve",
-            MODEL_NAME,
-            "--task",
-            "embed",
+            "Qwen/Qwen3-VL-Embedding-8B",
             "--runner",
             "pooling",
             "--trust-remote-code",
@@ -93,86 +133,45 @@ def embedding_server():
             "--port",
             str(VLLM_PORT),
         ],
-        check=True,
     )
 
-
-# ---------------------------------------------------------------------------
-# Query Router
-# ---------------------------------------------------------------------------
-
-
-@app.function(
-    image=query_router_image,
-    volumes={EMBEDDING_STORE_DIR: embedding_store_vol},
-    scaledown_window=30 * MINUTES,
-    min_containers=1,
-)
-@modal.asgi_app()
-def query_router():
-    import glob
-    import os
-    import re
-
-    import numpy as np
-    import pandas as pd
-    import requests
-    from fastapi import FastAPI, HTTPException, Request
-    from fastapi.responses import JSONResponse
-
-    # Sort parquet files by batch index
-    parquet_files = glob.glob(os.path.join(EMBEDDING_STORE_DIR, "embeddings_*.parquet"))
-    parquet_files.sort(
-        key=lambda p: int(re.search(r"embeddings_(\d+)\.parquet", p).group(1))
-    )
-
-    print(f"Found {len(parquet_files)} parquet files")
-
-    if not parquet_files:
-        raise ValueError("Embeddings store is empty")
-
-
-    df = pd.concat([pd.read_parquet(f) for f in parquet_files], ignore_index=True)
-
-    logger.info(f"Loaded {len(df)} embeddings from store")
-    embedding_matrix = np.array(df["embedding"].tolist())
-    embedding_urls = df["url"].tolist()
-    # vectors are already normalized — dot product == cosine similarity
+    wait_for_vllm_server()
 
     def get_text_embedding(text: str) -> list[float]:
         response = requests.post(
-            f"{EMBED_URL}/v1/embeddings",
+            f"http://localhost:{VLLM_PORT}/v1/embeddings",
             json={
                 "model": MODEL_NAME,
-                "input": [{"type": "text", "text": text}],
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": [{"type": "text", "text": INSTRUCTION}],
+                    },
+                    {"role": "user", "content": [{"type": "text", "text": text}]},
+                ],
+                "encoding_format": "float",
             },
-            timeout=60,
         )
         response.raise_for_status()
         return response.json()["data"][0]["embedding"]
 
-    web_app = FastAPI()
+    get_text_embedding("warm up")
 
-    @web_app.post("/search")
+    api_server = FastAPI()
+
+    @api_server.post("/search")
     async def search(request: Request):
         query = await request.json()
-        query_type = query.get("type")
-        logger.info(f"Search query: type={query_type!r} text={query.get('text', '')!r}")
+        query_text = query.get("text", "")
+        if not query_text:
+            raise HTTPException(status_code=400, detail="Query text is required")
 
-        if query_type == "video":
-            raise HTTPException(
-                status_code=400, detail="Video queries are not yet supported"
-            )
-        elif query_type != "text":
-            raise HTTPException(status_code=400, detail="Invalid query type")
+        query_embedding = get_text_embedding(query_text)
+        query_vec = cp.array(query_embedding)
 
-        query_embedding = get_text_embedding(query.get("text", ""))
-
-        query_vec = np.array(query_embedding)
-        query_vec = query_vec / np.linalg.norm(query_vec)
+        # At scale, replace with a database or ANN search
         similarities = embedding_matrix @ query_vec
-
-        best_idx = int(np.argmax(similarities))
+        best_idx = int(cp.argmax(similarities))
 
         return JSONResponse(
             content={
@@ -181,4 +180,5 @@ def query_router():
             }
         )
 
-    return web_app
+    print("Server startup completed")
+    return api_server
