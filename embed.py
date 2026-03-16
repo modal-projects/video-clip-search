@@ -14,21 +14,27 @@ logger = logging.getLogger(__name__)
 
 app = modal.App("video-clip-search-embed")
 
-EMBED_BATCH_SIZE = 200
+MINUTES = 60
+
 CLIPS_FILE_NAME = "dance-clips.csv"
 CLIPS_DIR = "/root/clips"
 EMBEDDING_STORE_DIR = "/root/embeddings"
-MINUTES = 60
+GPU = "RTX-PRO-6000"
 
+# AIST Dance Video Database, Basic and Advanced clips
 AIST_DANCE_BASIC_2MBPS_LINK_LIST_FILE_PATH = (
     "https://aistdancedb.ongaaccel.jp/data/video_refined/2M/refined_2M_sBM_url.csv"
 )
 AIST_DANCE_ADVANCED_2MBPS_LINK_LIST_FILE_PATH = (
     "https://aistdancedb.ongaaccel.jp/data/video_refined/2M/refined_2M_sFM_url.csv"
 )
+# Include the front, left, and right side camera views
+INCLUDED_CAMERA_VIEWS = ["c01", "c02", "c08"]
 
 MODEL_NAME = "Qwen/Qwen3-VL-Embedding-8B"
 VLLM_MAX_MODEL_LEN = 4096 * 10
+INSTRUCTION = "Represent the user's input video of a dance move."
+EMBED_BATCH_SIZE = 300
 
 
 # ---------------------------------------------------------------------------
@@ -40,13 +46,12 @@ def fetch_dance_clip_list(
     basic_url: str = AIST_DANCE_BASIC_2MBPS_LINK_LIST_FILE_PATH,
     advanced_url: str = AIST_DANCE_ADVANCED_2MBPS_LINK_LIST_FILE_PATH,
 ):
-
-    print(f"Fetching basic dance clip list from {basic_url}")
+    logger.info(f"Fetching basic dance clip list from {basic_url}")
     response = requests.get(basic_url)
     response.raise_for_status()
     basic_dance_clip_df = pd.read_csv(StringIO(response.text), header=None)
 
-    print(f"Fetching advanced dance clip list from {advanced_url}")
+    logger.info(f"Fetching advanced dance clip list from {advanced_url}")
     response = requests.get(advanced_url)
     response.raise_for_status()
     advanced_dance_clip_df = pd.read_csv(StringIO(response.text), header=None)
@@ -54,11 +59,7 @@ def fetch_dance_clip_list(
     return pd.concat([basic_dance_clip_df, advanced_dance_clip_df], ignore_index=True)
 
 
-INCLUDED_CAMERA_VIEWS = ["c01", "c02", "c08"]
-
-
 def filter_camera_view_clips(df):
-
     path_col = df.columns[0]
     return df[
         df[path_col].apply(
@@ -127,14 +128,14 @@ orchestrator_image = modal.Image.debian_slim().uv_pip_install(
 
 clips_vol = modal.Volume.from_name("clips-data", create_if_missing=True)
 embedding_store_vol = modal.Volume.from_name(
-    "danced-video-embeddings", create_if_missing=True
+    "dance-video-embeddings", create_if_missing=True
 )
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: Download clips (CPU, high parallelism)
+# Stage 1: Download clips in parallel
 # ---------------------------------------------------------------------------
 
 
@@ -161,17 +162,17 @@ def download_clip(clip_url: str) -> str:
     dest.write_bytes(resp.content)
     clips_vol.commit()
 
-    print(f"Downloaded {filename}")
+    logger.info(f"Downloaded {filename}")
     return filename
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: Embed videos (L40S GPU, offline vLLM)
+# Stage 2: Embed videos
 # ---------------------------------------------------------------------------
 
 
 @app.cls(
-    gpu="RTX-PRO-6000",
+    gpu=GPU,
     image=vllm_image,
     volumes={
         CLIPS_DIR: clips_vol,
@@ -188,7 +189,7 @@ class Embedder:
     def start(self):
         from vllm import LLM, EngineArgs
 
-        print("Loading vLLM embedding model...")
+        logger.info("Loading vLLM embedding model...")
         engine_args = EngineArgs(
             model=MODEL_NAME,
             runner="pooling",
@@ -200,7 +201,7 @@ class Embedder:
 
         # Warm up
         self.llm.embed([{"prompt": "warm up", "multi_modal_data": None}])
-        print("vLLM embedding model ready")
+        logger.info("vLLM embedding model ready")
 
     def _prepare_video_inputs(self, video_path: str) -> dict:
         """Build one vLLM embed input from a local video path."""
@@ -211,7 +212,7 @@ class Embedder:
                 "content": [
                     {
                         "type": "text",
-                        "text": "Represent the user's input video of a dance move.",
+                        "text": INSTRUCTION,
                     }
                 ],
             },
@@ -275,7 +276,9 @@ class Embedder:
         for url, output in zip(video_urls, outputs):
             rows.append({"url": url, "embedding": output.outputs.embedding})
 
-        print(f"Batch {batch_index}: embedded {len(rows)} videos in {int(duration_s)}s")
+        logger.info(
+            f"Batch {batch_index}: embedded {len(rows)} videos in {int(duration_s)}s"
+        )
 
         df = pd.DataFrame(rows)
         buf = BytesIO()
@@ -286,7 +289,7 @@ class Embedder:
             batch.put_file(buf, f"embeddings_{batch_index}.parquet")
         embedding_store_vol.commit()
 
-        print(f"Saved embeddings for batch {batch_index}")
+        logger.info(f"Saved embeddings for batch {batch_index}")
 
     @modal.exit()
     def stop(self):
@@ -307,12 +310,11 @@ def orchestrate():
 
     clips_df = pd.read_csv(os.path.join(CLIPS_DIR, CLIPS_FILE_NAME))
     clip_urls = clips_df.iloc[:, 0].astype(str).tolist()
-    print(f"Total clips to process: {len(clip_urls)}")
+    logger.info(f"Total clips to process: {len(clip_urls)}")
 
     # --- Stage 1: Download ---
-    print(f"Downloading {len(clip_urls)} clips...")
-    list(download_clip.map(clip_urls))
-    print("All clips downloaded")
+    files = list(download_clip.map(clip_urls))
+    logger.info(f"Downloaded {len(files)} clips to embed")
 
     # --- Stage 2: Embed ---
     existing = set(os.listdir(EMBEDDING_STORE_DIR))
@@ -322,7 +324,7 @@ def orchestrate():
         batch_idx = i // EMBED_BATCH_SIZE
         parquet_name = f"embeddings_{batch_idx}.parquet"
         if parquet_name in existing:
-            print(f"{parquet_name} exists, skipping")
+            logger.info(f"{parquet_name} exists, skipping")
             continue
 
         batch_urls = clip_urls[i : i + EMBED_BATCH_SIZE]
@@ -330,19 +332,19 @@ def orchestrate():
         batches.append((batch_idx, batch_filenames, batch_urls))
 
     if not batches:
-        print("All batches already embedded")
+        logger.info("All batches already embedded")
         return
 
-    print(f"Submitting {len(batches)} embedding batches")
+    # Start embedding batch jobs in parallel
+    logger.info(f"Submitting {len(batches)} embedding batches")
     embedder = Embedder()
     list(embedder.embed_batch.starmap(batches))
-    print(f"All {len(batches)} embedding batches complete")
+    logger.info(f"All {len(batches)} embedding batches complete")
 
 
 # ---------------------------------------------------------------------------
 # Local entrypoint — prepares clip list, kicks off orchestrator
 # ---------------------------------------------------------------------------
-
 
 @app.local_entrypoint()
 def main():
@@ -350,7 +352,7 @@ def main():
     volume_files = [file.path for file in dataset_vol.listdir("/")]
 
     if CLIPS_FILE_NAME not in volume_files:
-        print("Creating and uploading camera view clip list...")
+        logger.info("Creating and uploading camera view clip list...")
         camera_view_clips_df = create_camera_view_clips_df()
         with tempfile.NamedTemporaryFile(suffix=".csv", delete=True) as f:
             camera_view_clips_df.to_csv(f.name, index=False)
@@ -358,13 +360,13 @@ def main():
             with dataset_vol.batch_upload() as batch:
                 batch.put_file(f.name, CLIPS_FILE_NAME)
             dataset_vol.commit()
-        print(f"Uploaded {len(camera_view_clips_df)} clips to volume")
+        logger.info(f"Uploaded {len(camera_view_clips_df)} clips to volume")
     else:
-        print("Clip list already exists in volume")
+        logger.info(f"Clip list {CLIPS_FILE_NAME} already exists in volume")
 
-    print("Launching orchestrator...")
+    logger.info("Launching embedding pipeline...")
     orchestrate.remote()
-
+    logger.info("Embedding pipeline completed")
 
 """
 Video processing utilities with GPU-accelerated torchcodec decoding.
@@ -396,7 +398,6 @@ from qwen_vl_utils.vision_process import (
 logger = logging.getLogger(__name__)
 
 TORCHCODEC_NUM_THREADS = int(os.environ.get("TORCHCODEC_NUM_THREADS", 8))
-
 
 # ---------------------------------------------------------------------------
 # GPU torchcodec reader

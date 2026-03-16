@@ -2,9 +2,8 @@ import logging
 
 import modal
 import time
+import requests
 
-
-logger = logging.getLogger(__name__)
 
 app = modal.App("video-clip-search-servers")
 
@@ -39,7 +38,7 @@ vllm_image = (
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 embedding_store_vol = modal.Volume.from_name(
-    "danced-video-embeddings"
+    "dance-video-embeddings"
 )
 
 # ---------------------------------------------------------------------------
@@ -52,7 +51,7 @@ INSTRUCTION = "Represent the user's input."
 
 
 @app.function(
-    gpu=["L40S", "A100", "A100-80GB", "H100"],
+    gpu=["L40S", "A100"],
     image=vllm_image,
     volumes={
         "/root/.cache/huggingface": hf_cache_vol,
@@ -95,9 +94,8 @@ def video_search_server():
         key=lambda p: int(re.search(r"embeddings_(\d+)\.parquet", p).group(1))
     )
     df = pd.concat([pd.read_parquet(f) for f in parquet_files], ignore_index=True)
-    df = df[df["url"].astype(str).str.contains("_c01_", na=False)].reset_index(drop=True)
 
-    logger.info(f"Loaded {len(df)} embeddings from store")
+
     embedding_matrix = cp.array(df["embedding"].tolist())
     embedding_urls = df["url"].tolist()
 
