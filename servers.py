@@ -1,7 +1,6 @@
 import logging
 
 import modal
-import requests
 import time
 
 
@@ -40,7 +39,7 @@ vllm_image = (
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 embedding_store_vol = modal.Volume.from_name(
-    "video-clip-embeddings", create_if_missing=True
+    "danced-video-embeddings"
 )
 
 # ---------------------------------------------------------------------------
@@ -49,21 +48,7 @@ embedding_store_vol = modal.Volume.from_name(
 
 VLLM_PORT = 8000
 VLLM_MAX_MODEL_LEN = 4096 * 10
-INSTRUCTION = "Represent the user's input description of a dance move."
-
-
-def wait_for_vllm_server():
-    for _ in range(300):  # up to ~5 minutes
-        try:
-            r = requests.get(f"http://localhost:{VLLM_PORT}/health")
-            if r.status_code == 200:
-                print("vLLM server is ready")
-                return
-            print(f"vLLM server returned {r.status_code}, retrying...")
-        except requests.ConnectionError:
-            pass
-        time.sleep(1)
-    raise RuntimeError("vLLM server failed to start")
+INSTRUCTION = "Represent the user's input."
 
 
 @app.function(
@@ -105,10 +90,13 @@ def video_search_server():
     if len(parquet_files) == 0:
         raise ValueError("No embeddings found in store")
 
+    # sort parquet files by batch index
     parquet_files.sort(
         key=lambda p: int(re.search(r"embeddings_(\d+)\.parquet", p).group(1))
     )
     df = pd.concat([pd.read_parquet(f) for f in parquet_files], ignore_index=True)
+    df = df[df["url"].astype(str).str.contains("_c01_", na=False)].reset_index(drop=True)
+
     logger.info(f"Loaded {len(df)} embeddings from store")
     embedding_matrix = cp.array(df["embedding"].tolist())
     embedding_urls = df["url"].tolist()
@@ -182,3 +170,18 @@ def video_search_server():
 
     print("Server startup completed")
     return api_server
+
+
+
+def wait_for_vllm_server():
+    for _ in range(300):  # up to ~5 minutes
+        try:
+            r = requests.get(f"http://localhost:{VLLM_PORT}/health")
+            if r.status_code == 200:
+                print("vLLM server is ready")
+                return
+            print(f"vLLM server returned {r.status_code}, retrying...")
+        except requests.ConnectionError:
+            pass
+        time.sleep(1)
+    raise RuntimeError("vLLM server failed to start")
