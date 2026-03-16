@@ -6,6 +6,7 @@ import requests
 
 
 app = modal.App("video-clip-search-servers")
+logger = logging.getLogger(__name__)
 
 MODEL_NAME = "Qwen/Qwen3-VL-Embedding-8B"
 MINUTES = 60
@@ -37,9 +38,7 @@ vllm_image = (
 
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
-embedding_store_vol = modal.Volume.from_name(
-    "dance-video-embeddings"
-)
+embedding_store_vol = modal.Volume.from_name("dance-video-embeddings")
 
 # ---------------------------------------------------------------------------
 # GPU Embedding Server (vLLM serve)
@@ -83,7 +82,7 @@ def video_search_server():
     from fastapi import FastAPI, Request, HTTPException
     from fastapi.responses import JSONResponse
 
-    print("Loading embeddings")
+    logger.info("Loading embeddings")
     parquet_files = glob.glob(os.path.join(EMBEDDING_STORE_DIR, "embeddings_*.parquet"))
 
     if len(parquet_files) == 0:
@@ -95,11 +94,10 @@ def video_search_server():
     )
     df = pd.concat([pd.read_parquet(f) for f in parquet_files], ignore_index=True)
 
-
     embedding_matrix = cp.array(df["embedding"].tolist())
     embedding_urls = df["url"].tolist()
 
-    print("Starting vLLM server")
+    logger.info("Starting vLLM server")
     subprocess.Popen(
         [
             "vllm",
@@ -166,9 +164,8 @@ def video_search_server():
             }
         )
 
-    print("Server startup completed")
+    logger.info("Server startup completed")
     return api_server
-
 
 
 def wait_for_vllm_server():
@@ -176,9 +173,9 @@ def wait_for_vllm_server():
         try:
             r = requests.get(f"http://localhost:{VLLM_PORT}/health")
             if r.status_code == 200:
-                print("vLLM server is ready")
+                logger.info("vLLM server is ready")
                 return
-            print(f"vLLM server returned {r.status_code}, retrying...")
+            logger.info(f"vLLM server returned {r.status_code}, retrying...")
         except requests.ConnectionError:
             pass
         time.sleep(1)

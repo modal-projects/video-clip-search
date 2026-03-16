@@ -93,27 +93,22 @@ downloader_image = modal.Image.debian_slim().uv_pip_install(
 )
 
 vllm_image = (
-    modal.Image.from_registry("nvidia/cuda:12.9.0-devel-ubuntu22.04", add_python="3.13")
+    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.13")
     .entrypoint([])
     .apt_install("ffmpeg")
     .uv_pip_install(
         "vllm==0.16.0",
         "huggingface-hub==0.36.0",
         "qwen-vl-utils==0.0.14",
-        "torchcodec==0.9.0",
         "pandas",
         "numpy",
         "pyarrow",
-        "torch",
-        "torchvision",
-        "torchaudio",
+        "torchcodec==0.9.0",
+        "torch==2.9.1",
+        "torchvision==0.24.1",
+        "torchaudio==2.9.1",
     )
     .env({"HF_XET_HIGH_PERFORMANCE": "1", "FORCE_QWENVL_VIDEO_READER": "torchcodec"})
-    .run_commands(
-        [
-            "pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu129"
-        ]
-    )
 )
 
 orchestrator_image = modal.Image.debian_slim().uv_pip_install(
@@ -237,17 +232,15 @@ class Embedder:
         if image_patch_size is not None:
             vision_kwargs["image_patch_size"] = image_patch_size
 
-        image_inputs, video_inputs, video_kwargs = process_vision_info(
+        image_inputs, video_inputs, video_kwargs = process_video_inputs(
             messages, **vision_kwargs
         )
         if not video_inputs:
             raise ValueError(
-                f"process_vision_info returned no video inputs for {video_path}"
+                f"process_video_inputs returned no video inputs for {video_path}"
             )
 
         mm_data = {}
-        if image_inputs is not None:
-            mm_data["image"] = image_inputs
         if video_inputs is not None:
             mm_data["video"] = video_inputs
 
@@ -388,9 +381,7 @@ from qwen_vl_utils.vision_process import (
     VIDEO_MAX_TOKEN_NUM,
     VIDEO_MIN_TOKEN_NUM,
     calculate_video_frame_range,
-    ceil_by_factor,
     extract_vision_info,
-    fetch_image,
     smart_nframes,
     smart_resize,
 )
@@ -407,17 +398,28 @@ TORCHCODEC_NUM_THREADS = int(os.environ.get("TORCHCODEC_NUM_THREADS", 8))
 def _read_video_torchcodec_gpu(
     ele: Dict[str, Any],
 ) -> Tuple[torch.Tensor, dict, float]:
-    """Read video using torchcodec with GPU-accelerated decoding (device='cuda')."""
+    """Read video using torchcodec, preferring CUDA decode when supported."""
     import torch
-    from torchvision import transforms
-    from torchvision.transforms import InterpolationMode
     from torchcodec.decoders import VideoDecoder
 
     video_path = ele["video"]
     st = time.time()
-    decoder = VideoDecoder(
-        video_path, num_ffmpeg_threads=TORCHCODEC_NUM_THREADS, device="cuda"
-    )
+    decode_device = "cuda"
+    try:
+        decoder = VideoDecoder(
+            video_path, num_ffmpeg_threads=TORCHCODEC_NUM_THREADS, device="cuda"
+        )
+    except RuntimeError as err:
+        # Torch can report CUDA available while torchcodec/ffmpeg lacks CUDA decode support.
+        if "Unsupported device: cuda" not in str(err):
+            raise
+        decode_device = "cpu"
+        logger.warning(
+            "torchcodec cuda decode unavailable; falling back to cpu decode "
+            f"for {video_path}: {err}"
+        )
+        decoder = VideoDecoder(video_path, num_ffmpeg_threads=TORCHCODEC_NUM_THREADS)
+
     video_fps = decoder.metadata.average_fps
     total_frames = decoder.metadata.num_frames
     start_frame, end_frame, total_frames = calculate_video_frame_range(
@@ -428,7 +430,7 @@ def _read_video_torchcodec_gpu(
     sample_fps = nframes / max(total_frames, 1e-6) * video_fps
     video = decoder.get_frames_at(indices=idx).data
     logger.info(
-        f"torchcodec GPU: {video_path=}, {total_frames=}, {video_fps=}, "
+        f"torchcodec decode {decode_device}: {video_path=}, {total_frames=}, {video_fps=}, "
         f"time={time.time() - st:.3f}s"
     )
 
@@ -436,7 +438,7 @@ def _read_video_torchcodec_gpu(
         fps=video_fps,
         frames_indices=idx,
         total_num_frames=total_frames,
-        video_backend="torchcodec",
+        video_backend=f"torchcodec-{decode_device}",
     )
     return video, video_metadata, sample_fps
 
@@ -446,7 +448,7 @@ def _read_video_torchcodec_gpu(
 # ---------------------------------------------------------------------------
 
 
-def fetch_video(
+def fetch_and_decode_video(
     ele: Dict[str, Any],
     image_patch_size: int = 14,
     return_video_sample_fps: bool = False,
@@ -456,46 +458,15 @@ def fetch_video(
     import torch
     from torchvision import transforms
     from torchvision.transforms import InterpolationMode
-    from concurrent.futures import ThreadPoolExecutor
-    import numpy as np
 
     image_factor = image_patch_size * SPATIAL_MERGE_SIZE
     VIDEO_FRAME_MIN_PIXELS = VIDEO_MIN_TOKEN_NUM * image_factor * image_factor
     VIDEO_FRAME_MAX_PIXELS = VIDEO_MAX_TOKEN_NUM * image_factor * image_factor
 
-    if isinstance(ele["video"], str):
-        video, video_metadata, sample_fps = _read_video_torchcodec_gpu(ele)
-    else:
-        # List-of-frames fallback (CPU path, same as upstream)
-        assert isinstance(ele["video"], (list, tuple))
-        process_info = ele.copy()
-        process_info.pop("type", None)
-        process_info.pop("video", None)
+    if not isinstance(ele.get("video"), str):
+        raise ValueError("video input must be a string path or URL")
 
-        max_workers = min(8, len(ele["video"]))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(
-                    fetch_image, {"image": frame, **process_info}, image_patch_size
-                )
-                for frame in ele["video"]
-            ]
-            image_list = [f.result() for f in futures]
-
-        nframes = ceil_by_factor(len(image_list), FRAME_FACTOR)
-        if len(image_list) < nframes:
-            image_list.extend([image_list[-1]] * (nframes - len(image_list)))
-
-        sample_fps = ele.get("sample_fps", 2.0)
-        video = torch.stack(
-            [torch.from_numpy(np.array(img).transpose(2, 0, 1)) for img in image_list]
-        )
-        raw_fps = process_info.pop("raw_fps", sample_fps)
-        video_metadata = dict(
-            fps=raw_fps,
-            frames_indices=list(range(len(video))),
-            total_num_frames=(nframes / sample_fps) * raw_fps,
-        )
+    video, video_metadata, sample_fps = _read_video_torchcodec_gpu(ele)
 
     nframes, _, height, width = video.shape
     min_pixels = ele.get("min_pixels", VIDEO_FRAME_MIN_PIXELS)
@@ -540,46 +511,40 @@ def fetch_video(
 
 
 # ---------------------------------------------------------------------------
-# process_vision_info — same as qwen_vl_utils but uses our GPU fetch_video
+# process_video_inputs — similar to qwen_vl_utils.process_vision_info but uses our GPU video decoding
 # ---------------------------------------------------------------------------
 
 
-def process_vision_info(
+def process_video_inputs(
     conversations: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]],
     return_video_kwargs: bool = False,
     return_video_metadata: bool = False,
     image_patch_size: int = 14,
 ) -> Tuple[
     Optional[List],
-    Optional[List[Union[torch.Tensor, List]]],
+    Optional[List[torch.Tensor]],
     Optional[Dict[str, Any]],
 ]:
-    """Process vision info from conversations, using GPU video decoding."""
+    """Process video-only vision info from conversations using GPU decoding."""
+    # Get video inputs from conversations
     vision_infos = extract_vision_info(conversations)
 
-    image_inputs = []
     video_inputs = []
     video_sample_fps_list = []
 
     for vision_info in vision_infos:
-        if "image" in vision_info or "image_url" in vision_info:
-            image_inputs.append(
-                fetch_image(vision_info, image_patch_size=image_patch_size)
-            )
-        elif "video" in vision_info:
-            video_input, video_sample_fps = fetch_video(
-                vision_info,
-                return_video_sample_fps=True,
-                image_patch_size=image_patch_size,
-                return_video_metadata=return_video_metadata,
-            )
-            video_sample_fps_list.append(video_sample_fps)
-            video_inputs.append(video_input)
-        else:
-            raise ValueError("image, image_url or video should in content.")
+        if "video" not in vision_info:
+            raise ValueError("Expected video input type")
 
-    if len(image_inputs) == 0:
-        image_inputs = None
+        video_input, video_sample_fps = fetch_and_decode_video(
+            vision_info,
+            return_video_sample_fps=True,
+            image_patch_size=image_patch_size,
+            return_video_metadata=return_video_metadata,
+        )
+        video_sample_fps_list.append(video_sample_fps)
+        video_inputs.append(video_input)
+
     if len(video_inputs) == 0:
         video_inputs = None
 
@@ -588,5 +553,5 @@ def process_vision_info(
         video_kwargs.update({"fps": video_sample_fps_list})
 
     if return_video_kwargs:
-        return image_inputs, video_inputs, video_kwargs
-    return image_inputs, video_inputs
+        return None, video_inputs, video_kwargs
+    return None, video_inputs
