@@ -2,7 +2,6 @@ from io import BytesIO, StringIO
 import logging
 import os
 from pathlib import Path
-import tempfile
 import time
 
 import requests
@@ -339,24 +338,29 @@ def orchestrate():
 # Local entrypoint — prepares clip list, kicks off orchestrator
 # ---------------------------------------------------------------------------
 
+@app.function(
+    image=orchestrator_image,
+    volumes={CLIPS_DIR: clips_vol},
+    timeout=10 * MINUTES,
+)
+def prep_dataset():
+    """Fetch the AIST dance clip catalog and upload it to the clips volume if missing."""
+    clips_path = os.path.join(CLIPS_DIR, CLIPS_FILE_NAME)
+
+    if os.path.exists(clips_path):
+        logger.info(f"Clip list {CLIPS_FILE_NAME} already exists in volume")
+        return
+
+    logger.info("Creating and uploading camera view clip list...")
+    camera_view_clips_df = create_camera_view_clips_df()
+    camera_view_clips_df.to_csv(clips_path, index=False)
+    clips_vol.commit()
+    logger.info(f"Uploaded {len(camera_view_clips_df)} clips to volume")
+
+
 @app.local_entrypoint()
 def main():
-    dataset_vol = modal.Volume.from_name("clips-data", create_if_missing=True)
-    volume_files = [file.path for file in dataset_vol.listdir("/")]
-
-    if CLIPS_FILE_NAME not in volume_files:
-        logger.info("Creating and uploading camera view clip list...")
-        camera_view_clips_df = create_camera_view_clips_df()
-        with tempfile.NamedTemporaryFile(suffix=".csv", delete=True) as f:
-            camera_view_clips_df.to_csv(f.name, index=False)
-            f.flush()
-            with dataset_vol.batch_upload() as batch:
-                batch.put_file(f.name, CLIPS_FILE_NAME)
-            dataset_vol.commit()
-        logger.info(f"Uploaded {len(camera_view_clips_df)} clips to volume")
-    else:
-        logger.info(f"Clip list {CLIPS_FILE_NAME} already exists in volume")
-
+    prep_dataset.remote()
     logger.info("Launching embedding pipeline...")
     orchestrate.remote()
     logger.info("Embedding pipeline completed")
