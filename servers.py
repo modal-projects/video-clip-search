@@ -1,7 +1,11 @@
+import glob
 import logging
+import os
+import re
+import subprocess
+import time
 
 import modal
-import time
 import requests
 
 
@@ -24,7 +28,7 @@ vllm_image = (
         "huggingface-hub==0.36.0",
         "qwen-vl-utils==0.0.14",
         "torchcodec==0.9.0",
-        "fastapi",
+        "fastapi==0.135.1",
         "pandas",
         "requests",
         "numpy",
@@ -40,13 +44,17 @@ hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=Tru
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 embedding_store_vol = modal.Volume.from_name("dance-video-embeddings")
 
+with vllm_image.imports():
+    import pandas as pd
+    import cupy as cp
+    from fastapi import FastAPI, Request, HTTPException
+    from fastapi.responses import JSONResponse
+
 # ---------------------------------------------------------------------------
 # GPU Embedding Server (vLLM serve)
 # ---------------------------------------------------------------------------
 
 VLLM_PORT = 8000
-VLLM_MAX_MODEL_LEN = 4096 * 10
-INSTRUCTION = "Represent the user's input."
 
 
 @app.function(
@@ -70,17 +78,7 @@ def video_search_server():
     Clients POST {"text": "..."} and receive {"url": "...", "score": float}.
     Embeddings are loaded from parquet files in EMBEDDING_STORE_DIR on startup.
     """
-    import glob
-    import time
-    import os
-    import re
-    import subprocess
-
-    import pandas as pd
-    import cupy as cp
-    import requests
-    from fastapi import FastAPI, Request, HTTPException
-    from fastapi.responses import JSONResponse
+    VLLM_MAX_MODEL_LEN = 4096 * 10
 
     logger.info("Loading embeddings")
     parquet_files = glob.glob(os.path.join(EMBEDDING_STORE_DIR, "embeddings_*.parquet"))
@@ -129,7 +127,7 @@ def video_search_server():
                 "messages": [
                     {
                         "role": "system",
-                        "content": [{"type": "text", "text": INSTRUCTION}],
+                        "content": [{"type": "text", "text": "Represent the user's input."}],
                     },
                     {"role": "user", "content": [{"type": "text", "text": text}]},
                 ],
