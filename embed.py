@@ -71,6 +71,12 @@ vllm_image = (
         }
     )
 )
+with vllm_image.imports():
+    from vllm import LLM, EngineArgs
+    import torch
+    from torchcodec.decoders import VideoDecoder
+    from torchvision import transforms
+    from torchvision.transforms import InterpolationMode
 
 orchestrator_image = modal.Image.debian_slim().uv_pip_install(
     "pandas==3.0.1",
@@ -164,6 +170,7 @@ def download_clip_batch(clip_urls: list[str], batch_index: int):
     volumes={CLIPS_DIR: clips_vol},
     timeout=30 * MINUTES,
 )
+@modal.concurrent(target_inputs=8)
 def download_clip(clip_url: str) -> str:
     """Downloads a clip to a volume"""
     from pathlib import Path
@@ -182,6 +189,13 @@ def download_clip(clip_url: str) -> str:
 # ---------------------------------------------------------------------------
 # Step 3: Embed videos with vLLM offline inference, save to parquets in Modal volume
 # ---------------------------------------------------------------------------
+
+# args for processing video inputs with Qwen series models
+VISION_KWARGS = {
+    "return_video_kwargs": True,
+    "return_video_metadata": True,
+}
+
 @app.cls(
     gpu=GPU,
     cpu=NUM_NVDEC_UNITS * TORCHCODEC_NUM_THREADS,
@@ -198,8 +212,6 @@ def download_clip(clip_url: str) -> str:
 class Embedder:
     @modal.enter()
     def start(self):
-        from vllm import LLM, EngineArgs
-
         VLLM_MAX_MODEL_LEN = 4096 * 20
 
         logger.info("Loading vLLM embedding model...")
@@ -219,7 +231,7 @@ class Embedder:
         self.llm.embed([{"prompt": "warm up", "multi_modal_data": None}])
         logger.info("vLLM embedding model ready")
 
-    def _prepare_video_inputs(self, video_path: str) -> dict:
+    def _prepare_video_inputs(self, video_path: str, vision_kwargs: dict) -> dict:
         """Build one vLLM embed input from a local video path."""
 
         messages = [
@@ -244,16 +256,14 @@ class Embedder:
             messages, tokenize=False, add_generation_prompt=True
         )
 
-        vision_kwargs = {
-            "return_video_kwargs": True,
-            "return_video_metadata": True,
-        }
+        # apply Qwen series image patch size
         image_patch_size = getattr(
             getattr(processor, "image_processor", None), "patch_size", None
         )
         if image_patch_size is not None:
             vision_kwargs["image_patch_size"] = image_patch_size
 
+        # decode video frames into tensors
         _, video_inputs, video_kwargs = process_video_inputs(messages, **vision_kwargs)
         if not video_inputs:
             raise ValueError(
@@ -264,6 +274,7 @@ class Embedder:
         if video_inputs is not None:
             mm_data["video"] = video_inputs
 
+        # format for multimodal input expected by vLLM
         return {
             "prompt": prompt_text,
             "multi_modal_data": mm_data,
@@ -281,13 +292,18 @@ class Embedder:
 
         file_name = f"embeddings_{batch_index}.parquet"
         if os.path.exists(os.path.join(EMBEDDING_STORE_DIR, file_name)):
-            logger.info(f"Embeddings for batch {batch_index} already exist, skipping...")
+            logger.info(
+                f"Embeddings for batch {batch_index} already exist, skipping..."
+            )
             return
 
         process_start = time.time()
         video_paths = [str(Path(CLIPS_DIR) / filename) for filename in video_filenames]
+        vision_kwargs = VISION_KWARGS.copy()
+
         with ThreadPoolExecutor(max_workers=NUM_NVDEC_UNITS) as pool:
-            vllm_inputs = list(pool.map(self._prepare_video_inputs, video_paths))
+            vllm_inputs = list(pool.map(self._prepare_video_inputs, video_paths, vision_kwargs))
+
         process_duration_s = time.time() - process_start
         logger.info(
             f"Processed {len(vllm_inputs)} videos in {int(process_duration_s)}s"
@@ -424,17 +440,15 @@ from qwen_vl_utils.vision_process import (
 # ---------------------------------------------------------------------------
 
 
-def _read_video_torchcodec_gpu(
+def _read_video_torchcodec(
     ele: Dict[str, Any],
     num_ffmpeg_threads: int = 4,
 ) -> Tuple["torch.Tensor", dict, float]:
     """Read video using torchcodec, preferring CUDA decode when supported."""
-    import torch
-    from torchcodec.decoders import VideoDecoder
 
     video_path = ele["video"]
     st = time.time()
-    decode_device = "cuda"
+    decode_device = "cuda" if torch.cuda.is_available() else "cpu"
     try:
         decoder = VideoDecoder(
             video_path, num_ffmpeg_threads=num_ffmpeg_threads, device="cuda"
@@ -485,31 +499,30 @@ def fetch_and_decode_video(
     return_video_metadata: bool = False,
 ) -> Union["torch.Tensor", Tuple]:
     """Fetch and preprocess a video, using GPU torchcodec decoding."""
-    from torchvision import transforms
-    from torchvision.transforms import InterpolationMode
 
+    # QwenVL series specific video frame tokenization parameters
     image_factor = image_patch_size * SPATIAL_MERGE_SIZE
-    VIDEO_FRAME_MIN_PIXELS = VIDEO_MIN_TOKEN_NUM * image_factor * image_factor
-    VIDEO_FRAME_MAX_PIXELS = VIDEO_MAX_TOKEN_NUM * image_factor * image_factor
+    video_frame_min_pixels = VIDEO_MIN_TOKEN_NUM * image_factor * image_factor
+    video_frame_max_pixels = VIDEO_MAX_TOKEN_NUM * image_factor * image_factor
 
     if not isinstance(ele.get("video"), str):
         raise ValueError("video input must be a string path or URL")
 
     # number of cpu threads per gpu video decoding task
-    TORCHCODEC_NUM_THREADS = int(os.environ.get("TORCHCODEC_NUM_THREADS", 4))
-    video, video_metadata, sample_fps = _read_video_torchcodec_gpu(
-        ele, num_ffmpeg_threads=TORCHCODEC_NUM_THREADS
+    num_ffmpeg_threads = int(os.environ.get("TORCHCODEC_NUM_THREADS", 4))
+    video, video_metadata, sample_fps = _read_video_torchcodec(
+        ele, num_ffmpeg_threads=num_ffmpeg_threads
     )
     # return video to cpu
     video = video.to("cpu")
 
     nframes, _, height, width = video.shape
-    min_pixels = ele.get("min_pixels", VIDEO_FRAME_MIN_PIXELS)
-    total_pixels = ele.get(
+    min_pixels = ele.get("min_pixels", video_frame_min_pixels)
+    total_pixels = ele.get( 
         "total_pixels", MODEL_SEQ_LEN * image_factor * image_factor * 0.9
     )
     max_pixels = max(
-        min(VIDEO_FRAME_MAX_PIXELS, total_pixels / nframes * FRAME_FACTOR),
+        min(video_frame_max_pixels, total_pixels / nframes * FRAME_FACTOR),
         int(min_pixels * 1.05),
     )
     max_pixels_supposed = ele.get("max_pixels", max_pixels)

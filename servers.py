@@ -50,7 +50,7 @@ INSTRUCTION = "Represent the user's input."
 
 
 @app.function(
-    gpu=["L40S", "A100"],
+    gpu="L40S",
     image=vllm_image,
     volumes={
         "/root/.cache/huggingface": hf_cache_vol,
