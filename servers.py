@@ -78,6 +78,8 @@ def video_search_server():
     Clients POST {"text": "..."} and receive {"url": "...", "score": float}.
     Embeddings are loaded from parquet files in EMBEDDING_STORE_DIR on startup.
     """
+    VLLM_MAX_MODEL_LEN = 4096 * 10
+
     logger.info("Loading embeddings")
     parquet_files = glob.glob(os.path.join(EMBEDDING_STORE_DIR, "embeddings_*.parquet"))
 
@@ -103,7 +105,7 @@ def video_search_server():
             "pooling",
             "--trust-remote-code",
             "--max-model-len",
-            "40960",
+            str(VLLM_MAX_MODEL_LEN),
             "--dtype",
             "bfloat16",
             "--attention-backend",
