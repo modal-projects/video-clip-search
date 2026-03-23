@@ -196,6 +196,7 @@ VISION_KWARGS = {
     "return_video_metadata": True,
 }
 
+
 @app.cls(
     gpu=GPU,
     cpu=NUM_NVDEC_UNITS * TORCHCODEC_NUM_THREADS,
@@ -302,7 +303,9 @@ class Embedder:
         vision_kwargs = VISION_KWARGS.copy()
 
         with ThreadPoolExecutor(max_workers=NUM_NVDEC_UNITS) as pool:
-            vllm_inputs = list(pool.map(self._prepare_video_inputs, video_paths, vision_kwargs))
+            vllm_inputs = list(
+                pool.map(self._prepare_video_inputs, video_paths, vision_kwargs)
+            )
 
         process_duration_s = time.time() - process_start
         logger.info(
@@ -518,7 +521,7 @@ def fetch_and_decode_video(
 
     nframes, _, height, width = video.shape
     min_pixels = ele.get("min_pixels", video_frame_min_pixels)
-    total_pixels = ele.get( 
+    total_pixels = ele.get(
         "total_pixels", MODEL_SEQ_LEN * image_factor * image_factor * 0.9
     )
     max_pixels = max(

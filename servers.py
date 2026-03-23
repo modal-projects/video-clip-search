@@ -127,7 +127,9 @@ def video_search_server():
                 "messages": [
                     {
                         "role": "system",
-                        "content": [{"type": "text", "text": "Represent the user's input."}],
+                        "content": [
+                            {"type": "text", "text": "Represent the user's input."}
+                        ],
                     },
                     {"role": "user", "content": [{"type": "text", "text": text}]},
                 ],
