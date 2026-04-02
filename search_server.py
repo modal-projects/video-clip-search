@@ -138,30 +138,71 @@ def video_search_server():
 
     wait_for_vllm_server()
 
-    def get_text_embedding(text: str) -> list[list[float]]:
+    def get_query_embedding(query: dict) -> list[list[float]]:
         """Returns multi-vector embedding: list of per-token vectors (num_tokens x 320)."""
+        query_type = str(query.get("type", "text")).lower()
+        if query_type == "text":
+            text = query.get("text", "")
+            if not text:
+                raise HTTPException(status_code=400, detail="text is required for type='text'")
+            payload = {"model": MODEL_NAME, "input": [text]}
+        elif query_type == "image":
+            image_url = query.get("image_url", "")
+            if not image_url:
+                raise HTTPException(
+                    status_code=400, detail="image_url is required for type='image'"
+                )
+            payload = {
+                "model": MODEL_NAME,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                            {"type": "text", "text": "Represent this image."},
+                        ],
+                    }
+                ],
+            }
+        elif query_type == "video":
+            video_url = query.get("video_url", "")
+            if not video_url:
+                raise HTTPException(
+                    status_code=400, detail="video_url is required for type='video'"
+                )
+            payload = {
+                "model": MODEL_NAME,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "video_url", "video_url": {"url": video_url}},
+                            {"type": "text", "text": "Represent this video."},
+                        ],
+                    }
+                ],
+            }
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="type must be one of: text, image, video",
+            )
+
         response = requests.post(
             f"http://localhost:{VLLM_PORT}/pooling",
-            json={
-                "model": MODEL_NAME,
-                "input": [text],
-            },
+            json=payload,
         )
         response.raise_for_status()
         return response.json()["data"][0]["data"]
 
-    get_text_embedding("warm up")
+    get_query_embedding({"type": "text", "text": "warm up"})
 
     api_server = FastAPI()
 
     @api_server.post("/search")
     async def search(request: Request):
         query = await request.json()
-        query_text = query.get("text", "")
-        if not query_text:
-            raise HTTPException(status_code=400, detail="Query text is required")
-
-        query_embedding = get_text_embedding(query_text)
+        query_embedding = get_query_embedding(query)
         query_vecs = cp.array(query_embedding, dtype=cp.float32)  # (M, 320)
 
         # MaxSim scoring: for each query token, find max similarity with any doc token, then sum
