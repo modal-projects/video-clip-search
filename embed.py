@@ -30,6 +30,7 @@ MINUTES = 60
 NUM_NVDEC_UNITS = 4  # For RTX-PRO-6000
 # cpu threads per gpu video decoding task
 TORCHCODEC_NUM_THREADS = 2
+MAX_NUM_VISUAL_TOKENS = 5120
 
 # ---------------------------------------------------------------------------
 # Images & Volumes
@@ -48,11 +49,11 @@ with downloader_image.imports():
     import requests
 
 vllm_image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.13")
+    modal.Image.from_registry("nvidia/cuda:12.9.0-devel-ubuntu22.04", add_python="3.13")
     .entrypoint([])
     .apt_install("ffmpeg")
     .uv_pip_install(
-        "vllm==0.16.0",
+        "vllm==0.17.0",
         "huggingface-hub==0.36.0",
         "qwen-vl-utils==0.0.14",
         "pandas==3.0.1",
@@ -60,9 +61,9 @@ vllm_image = (
         "pyarrow==23.0.1",
     )
     .run_commands(
-        "pip install torchcodec==0.9.0 --index-url=https://download.pytorch.org/whl/cu128"
+        "pip install torchcodec==0.10.0 --index-url=https://download.pytorch.org/whl/cu129"
     )
-    .uv_pip_install("torch==2.9.0", "torchvision==0.24.0", "torchaudio==2.9.0")
+    .uv_pip_install("torch==2.10.0", "torchvision==0.25.0", "torchaudio==2.10.0")
     .env(
         {
             "HF_XET_HIGH_PERFORMANCE": "1",
@@ -94,7 +95,9 @@ with orchestrator_image.imports():
 # Volume to store video clips
 clips_vol = modal.Volume.from_name("video-clips", create_if_missing=True)
 # Volume to store video embeddings
-embedding_store_vol = modal.Volume.from_name("video-embeddings", create_if_missing=True)
+embedding_store_vol = modal.Volume.from_name(
+    "colqwen3-video-embeddings2", create_if_missing=True
+)
 # Volume for Hugging Face cache of model weights
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 # Volume for vLLM cache
@@ -170,7 +173,7 @@ def download_clip_batch(clip_urls: list[str], batch_index: int):
     volumes={CLIPS_DIR: clips_vol},
     timeout=30 * MINUTES,
 )
-@modal.concurrent(target_inputs=8)
+@modal.concurrent(target_inputs=8, max_inputs=10)
 def download_clip(clip_url: str) -> str:
     """Downloads a clip to a volume"""
     from pathlib import Path
@@ -217,7 +220,7 @@ class Embedder:
 
         logger.info("Loading vLLM embedding model...")
         engine_args = EngineArgs(
-            model="Qwen/Qwen3-VL-Embedding-8B",
+            model="TomoroAI/tomoro-colqwen3-embed-4b",
             runner="pooling",
             dtype="bfloat16",
             trust_remote_code=True,
@@ -228,8 +231,17 @@ class Embedder:
         self.llm = LLM(**vars(engine_args))
         self.processor = self.llm.llm_engine.tokenizer
 
-        # Warm up
-        self.llm.embed([{"prompt": "warm up", "multi_modal_data": None}])
+        # Set max number of visual tokens per video input, per model card guidance
+        setattr(self.processor, "max_num_visual_tokens", MAX_NUM_VISUAL_TOKENS)
+        image_processor = getattr(self.processor, "image_processor", None)
+        if image_processor is not None:
+            setattr(image_processor, "max_num_visual_tokens", MAX_NUM_VISUAL_TOKENS)
+
+        # Warm up model
+        warump_prompt = ["warm up text input"]
+        for _ in range(3):
+            self.llm.encode(warump_prompt, pooling_task="token_embed")
+
         logger.info("vLLM embedding model ready")
 
     def _prepare_video_inputs(self, video_path: str, vision_kwargs: dict) -> dict:
@@ -300,11 +312,14 @@ class Embedder:
 
         process_start = time.time()
         video_paths = [str(Path(CLIPS_DIR) / filename) for filename in video_filenames]
-        vision_kwargs = VISION_KWARGS.copy()
-
         with ThreadPoolExecutor(max_workers=NUM_NVDEC_UNITS) as pool:
             vllm_inputs = list(
-                pool.map(self._prepare_video_inputs, video_paths, vision_kwargs)
+                pool.map(
+                    lambda video_path: self._prepare_video_inputs(
+                        video_path, VISION_KWARGS.copy()
+                    ),
+                    video_paths,
+                )
             )
 
         process_duration_s = time.time() - process_start
@@ -313,17 +328,25 @@ class Embedder:
         )
 
         embed_start = time.time()
-        outputs = self.llm.embed(vllm_inputs)
+        outputs = self.llm.encode(vllm_inputs, pooling_task="token_embed")
         duration_s = time.time() - embed_start
 
         logger.info(
             f"Batch {batch_index}: embedded {len(vllm_inputs)} videos in {int(duration_s)}s"
         )
 
-        # Create parquet rows with columns "url" and "embedding"
+        # Create parquet rows: one row per token embedding per video (multi-vector / ColBERT style)
         rows = []
         for url, output in zip(video_urls, outputs):
-            rows.append({"url": url, "embedding": output.outputs.embedding})
+            token_embeddings = output.outputs.data  # 2D: (num_tokens, embedding_dim)
+            for token_idx, token_vec in enumerate(token_embeddings):
+                rows.append(
+                    {
+                        "url": url,
+                        "token_index": token_idx,
+                        "embedding": token_vec.tolist(),
+                    }
+                )
 
         df = pd.DataFrame(rows)
         buf = BytesIO()
@@ -334,6 +357,7 @@ class Embedder:
         with embedding_store_vol.batch_upload() as batch:
             batch.put_file(buf, f"embeddings_{batch_index}.parquet")
         embedding_store_vol.commit()
+        # Optionally, write embeddings to a vector database here
         logger.info(f"Saved embeddings for batch {batch_index}")
 
     @modal.exit()

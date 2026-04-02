@@ -12,7 +12,7 @@ import requests
 app = modal.App("video-clip-search-servers")
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "Qwen/Qwen3-VL-Embedding-8B"
+MODEL_NAME = "TomoroAI/tomoro-colqwen3-embed-4b"
 MINUTES = 60
 EMBEDDING_STORE_DIR = "/root/embeddings"
 
@@ -24,7 +24,7 @@ vllm_image = (
     .entrypoint([])
     .apt_install("ffmpeg")
     .uv_pip_install(
-        "vllm==0.16.0",
+        "vllm==0.18.0",
         "huggingface-hub==0.36.0",
         "qwen-vl-utils==0.0.14",
         "torchcodec==0.9.0",
@@ -42,7 +42,7 @@ vllm_image = (
 
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
-embedding_store_vol = modal.Volume.from_name("dance-video-embeddings")
+embedding_store_vol = modal.Volume.from_name("colqwen3-video-embeddings2")
 
 with vllm_image.imports():
     import pandas as pd
@@ -58,7 +58,7 @@ VLLM_PORT = 8000
 
 
 @app.function(
-    gpu="L40S",
+    gpu="A100-80GB",
     image=vllm_image,
     volumes={
         "/root/.cache/huggingface": hf_cache_vol,
@@ -78,7 +78,7 @@ def video_search_server():
     Clients POST {"text": "..."} and receive {"url": "...", "score": float}.
     Embeddings are loaded from parquet files in EMBEDDING_STORE_DIR on startup.
     """
-    VLLM_MAX_MODEL_LEN = 4096 * 10
+    VLLM_MAX_MODEL_LEN = 4096 * 2
 
     logger.info("Loading embeddings")
     parquet_files = glob.glob(os.path.join(EMBEDDING_STORE_DIR, "embeddings_*.parquet"))
@@ -91,16 +91,33 @@ def video_search_server():
         key=lambda p: int(re.search(r"embeddings_(\d+)\.parquet", p).group(1))
     )
     df = pd.concat([pd.read_parquet(f) for f in parquet_files], ignore_index=True)
+    df = df.sort_values(["url", "token_index"]).reset_index(drop=True)
 
-    embedding_matrix = cp.array(df["embedding"].tolist())
-    embedding_urls = df["url"].tolist()
+    # Multi-vector: one row per token per video
+    all_embeddings = cp.array(
+        df["embedding"].tolist(), dtype=cp.float32
+    )  # (total_tokens, 320)
+
+    # Build per-document offset table for MaxSim scoring
+    doc_urls = []
+    doc_offsets = []  # (start, end) indices into all_embeddings
+    cursor = 0
+    for url, group in df.groupby("url", sort=False):
+        n = len(group)
+        doc_urls.append(url)
+        doc_offsets.append((cursor, cursor + n))
+        cursor += n
+
+    logger.info(
+        f"Loaded {len(doc_urls)} documents, {all_embeddings.shape[0]} total token embeddings"
+    )
 
     logger.info("Starting vLLM server")
     subprocess.Popen(
         [
             "vllm",
             "serve",
-            "Qwen/Qwen3-VL-Embedding-8B",
+            "TomoroAI/tomoro-colqwen3-embed-4b",
             "--runner",
             "pooling",
             "--trust-remote-code",
@@ -108,6 +125,8 @@ def video_search_server():
             str(VLLM_MAX_MODEL_LEN),
             "--dtype",
             "bfloat16",
+            "--gpu-memory-utilization",
+            "0.75",
             "--attention-backend",
             "flashinfer",
             "--host",
@@ -119,25 +138,17 @@ def video_search_server():
 
     wait_for_vllm_server()
 
-    def get_text_embedding(text: str) -> list[float]:
+    def get_text_embedding(text: str) -> list[list[float]]:
+        """Returns multi-vector embedding: list of per-token vectors (num_tokens x 320)."""
         response = requests.post(
-            f"http://localhost:{VLLM_PORT}/v1/embeddings",
+            f"http://localhost:{VLLM_PORT}/pooling",
             json={
                 "model": MODEL_NAME,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": [
-                            {"type": "text", "text": "Represent the user's input."}
-                        ],
-                    },
-                    {"role": "user", "content": [{"type": "text", "text": text}]},
-                ],
-                "encoding_format": "float",
+                "input": [text],
             },
         )
         response.raise_for_status()
-        return response.json()["data"][0]["embedding"]
+        return response.json()["data"][0]["data"]
 
     get_text_embedding("warm up")
 
@@ -151,16 +162,23 @@ def video_search_server():
             raise HTTPException(status_code=400, detail="Query text is required")
 
         query_embedding = get_text_embedding(query_text)
-        query_vec = cp.array(query_embedding)
+        query_vecs = cp.array(query_embedding, dtype=cp.float32)  # (M, 320)
 
-        # At scale, replace with a database or ANN search
-        similarities = embedding_matrix @ query_vec
-        best_idx = int(cp.argmax(similarities))
+        # MaxSim scoring: for each query token, find max similarity with any doc token, then sum
+        # Single large GEMM for all pairwise token similarities
+        sim_matrix = query_vecs @ all_embeddings.T  # (M, total_tokens)
+
+        # Score each document by slicing its token columns
+        scores = cp.empty(len(doc_offsets), dtype=cp.float32)
+        for i, (start, end) in enumerate(doc_offsets):
+            scores[i] = sim_matrix[:, start:end].max(axis=1).sum()
+
+        best_idx = int(cp.argmax(scores))
 
         return JSONResponse(
             content={
-                "url": embedding_urls[best_idx],
-                "score": float(similarities[best_idx]),
+                "url": doc_urls[best_idx],
+                "score": float(scores[best_idx]),
             }
         )
 
