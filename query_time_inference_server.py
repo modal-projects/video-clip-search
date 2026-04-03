@@ -1,9 +1,9 @@
 import logging
 import subprocess
 import time
+import requests
 
 import modal
-import requests
 
 
 app = modal.App("video-clip-search-query-inference")
@@ -12,7 +12,6 @@ logger = logging.getLogger(__name__)
 MODEL_NAME = "TomoroAI/tomoro-colqwen3-embed-4b"
 MINUTES = 60
 VLLM_PORT = 8000
-API_PORT = 8080
 VLLM_MAX_MODEL_LEN = 4096 * 10
 
 
@@ -24,10 +23,12 @@ vllm_image = (
         "vllm==0.18.0",
         "huggingface-hub==0.36.0",
         "qwen-vl-utils==0.0.14",
-        "torchcodec==0.9.0",
         "fastapi==0.135.1",
         "uvicorn==0.32.1",
         "requests==2.32.3",
+    )
+    .run_commands(
+        "pip install torchcodec==0.10.0 --index-url=https://download.pytorch.org/whl/cu129"
     )
     .env({"HF_XET_HIGH_PERFORMANCE": "1", "FORCE_QWENVL_VIDEO_READER": "torchcodec"})
 )
@@ -37,16 +38,7 @@ vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 
 
 with vllm_image.imports():
-    import uvicorn
-    from fastapi import FastAPI, HTTPException
-    from pydantic import BaseModel
-
-
-class EmbedRequest(BaseModel):
-    type: str
-    text: str | None = None
-    image_url: str | None = None
-    video_url: str | None = None
+    from fastapi import FastAPI, HTTPException, Request
 
 
 def wait_for_vllm_server():
@@ -63,15 +55,17 @@ def wait_for_vllm_server():
     raise RuntimeError("vLLM server failed to start")
 
 
-def make_pooling_payload(req: EmbedRequest) -> dict:
-    query_type = req.type.lower()
+def create_inference_payload(req: dict) -> dict:
+    query_type = str(req.get("type", "")).lower()
     if query_type == "text":
-        if not req.text:
+        text = req.get("text", "")
+        if not text:
             raise HTTPException(status_code=400, detail="text is required for type='text'")
-        return {"model": MODEL_NAME, "input": [req.text]}
+        return {"model": MODEL_NAME, "input": [text]}
 
     if query_type == "image":
-        if not req.image_url:
+        image_url = req.get("image_url", "")
+        if not image_url:
             raise HTTPException(
                 status_code=400, detail="image_url is required for type='image'"
             )
@@ -81,7 +75,7 @@ def make_pooling_payload(req: EmbedRequest) -> dict:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image_url", "image_url": {"url": req.image_url}},
+                        {"type": "image_url", "image_url": {"url": image_url}},
                         {"type": "text", "text": "Represent this image."},
                     ],
                 }
@@ -89,7 +83,8 @@ def make_pooling_payload(req: EmbedRequest) -> dict:
         }
 
     if query_type == "video":
-        if not req.video_url:
+        video_url = req.get("video_url", "")
+        if not video_url:
             raise HTTPException(
                 status_code=400, detail="video_url is required for type='video'"
             )
@@ -99,7 +94,7 @@ def make_pooling_payload(req: EmbedRequest) -> dict:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "video_url", "video_url": {"url": req.video_url}},
+                        {"type": "video_url", "video_url": {"url": video_url}},
                         {"type": "text", "text": "Represent this video."},
                     ],
                 }
@@ -110,7 +105,7 @@ def make_pooling_payload(req: EmbedRequest) -> dict:
 
 
 @app.function(
-    gpu="A100-80GB",
+    gpu="L40S",
     image=vllm_image,
     volumes={
         "/root/.cache/huggingface": hf_cache_vol,
@@ -122,7 +117,7 @@ def make_pooling_payload(req: EmbedRequest) -> dict:
     max_containers=5,
 )
 @modal.concurrent(max_inputs=10)
-@modal.experimental.http_server(port=API_PORT, startup_timeout=120)
+@modal.asgi_app()
 def query_inference_server():
     logger.info("Starting vLLM server")
     subprocess.Popen(
@@ -156,11 +151,12 @@ def query_inference_server():
     )
     warmup_response.raise_for_status()
 
-    api = FastAPI()
+    api_server = FastAPI()
 
-    @api.post("/embed")
-    def embed(req: EmbedRequest):
-        payload = make_pooling_payload(req)
+    @api_server.post("/embed")
+    async def embed(request: Request):
+        req = await request.json()
+        payload = create_inference_payload(req)
         response = requests.post(
             f"http://localhost:{VLLM_PORT}/pooling",
             json=payload,
@@ -169,6 +165,11 @@ def query_inference_server():
         if not response.ok:
             raise HTTPException(status_code=response.status_code, detail=response.text)
         data = response.json()
-        return {"embedding": data["data"][0]["data"]}
+        embedding = data["data"][0]["data"]
+        return {
+            "embedding": embedding,
+            "total_token_embeddings": len(embedding),
+        }
 
-    uvicorn.run(api, host="0.0.0.0", port=API_PORT, log_level="info")
+    logger.info("Server startup completed")
+    return api_server

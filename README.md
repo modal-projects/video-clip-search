@@ -34,3 +34,60 @@ For simplicity, this example uses only the basic and advanced clips from the fro
 - Serverless architecture — embed a large video corpus without managing infrastructure
 - Pairs naturally with Modal Volumes for storing embeddings and video data
 - Fast iteration between CPU (search/retrieval) and GPU (embedding) workloads
+
+## Query inference server
+
+`query_inference_server.py` is a standalone embedding service.
+
+It starts `vllm serve` with the pooling runner and exposes one endpoint:
+
+- `POST /embed`
+- input payload has a required `type` field: `text`, `image`, or `video`
+- output is always token-level multi-vector embeddings under `embedding`
+
+Run it:
+
+```bash
+modal serve query_inference_server.py
+```
+
+Deploy it:
+
+```bash
+modal deploy query_inference_server.py
+```
+
+### Local request examples
+
+Text:
+
+```bash
+curl -X POST "$URL/embed" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "text",
+    "text": "two dancers doing synchronized footwork"
+  }'
+```
+
+Image:
+
+```bash
+curl -X POST "$URL/embed" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "image",
+    "image_url": "https://example.com/frame.jpg"
+  }'
+```
+
+Video:
+
+```bash
+curl -X POST "$URL/embed" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "video",
+    "video_url": "https://example.com/clip.mp4"
+  }'
+```

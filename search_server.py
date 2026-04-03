@@ -27,13 +27,15 @@ vllm_image = (
         "vllm==0.18.0",
         "huggingface-hub==0.36.0",
         "qwen-vl-utils==0.0.14",
-        "torchcodec==0.9.0",
         "fastapi==0.135.1",
         "pandas==3.0.1",
         "requests==2.32.3",
         "numpy==2.0.0",
         "pyarrow==23.0.1",
         "cupy-cuda12x==14.0.0",
+    )
+    .run_commands(
+        "pip install torchcodec==0.10.0 --index-url=https://download.pytorch.org/whl/cu129"
     )
     .env({"HF_XET_HIGH_PERFORMANCE": "1", "FORCE_QWENVL_VIDEO_READER": "torchcodec"})
 )

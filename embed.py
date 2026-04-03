@@ -11,6 +11,18 @@ import modal
 from typing import Any, Dict, List, Optional, Tuple, Union
 from io import BytesIO, StringIO
 
+from qwen_vl_utils.vision_process import (
+    FRAME_FACTOR,
+    MODEL_SEQ_LEN,
+    SPATIAL_MERGE_SIZE,
+    VIDEO_MAX_TOKEN_NUM,
+    VIDEO_MIN_TOKEN_NUM,
+    calculate_video_frame_range,
+    extract_vision_info,
+    smart_nframes,
+    smart_resize,
+)
+
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -447,20 +459,6 @@ Video processing utilities with GPU-accelerated torchcodec decoding.
 Mirrors qwen_vl_utils.process_vision_info but creates
 torchcodec.VideoDecoder(device='cuda') for on-GPU video decoding.
 """
-
-
-from qwen_vl_utils.vision_process import (
-    FRAME_FACTOR,
-    MODEL_SEQ_LEN,
-    SPATIAL_MERGE_SIZE,
-    VIDEO_MAX_TOKEN_NUM,
-    VIDEO_MIN_TOKEN_NUM,
-    calculate_video_frame_range,
-    extract_vision_info,
-    smart_nframes,
-    smart_resize,
-)
-
 
 # ---------------------------------------------------------------------------
 # GPU torchcodec reader
