@@ -1,93 +1,108 @@
-# Video Clip Search
+# Video Clip Search with TomoroAI colqwen3-embed
 
-A Modal example demonstrating video embedding and semantic search — find video clips using natural language queries.
+This repository demonstrates end-to-end video retrieval on Modal using the
+`TomoroAI/tomoro-colqwen3-embed-4b` multi-vector embedding model.
 
-## Concept
+The demo indexes clips from the [AIST Dance Video Database](https://aistdancedb.ongaaccel.jp/)
+and serves text-to-video search with ColBERT-style MaxSim scoring.
 
-This project showcases video retrieval, specifically cross-modal search across a corpus of videos: given a text query, find the best matching video from a large collection.
+## Demo Overview
 
-Both tasks are benchmarked on [MMEB (Massive Multimodal Embedding Benchmark)](https://huggingface.co/spaces/TIGER-Lab/MMEB-Leaderboard).
+This demo showcases an example multimodal retrieval, where one can query a corpus of clips of street dance video clips with text descriptions as queries. Text queries are embedded with TomoroAI/tomoro-colqwen3-embed-4b, and search is performed across the 4200 clip corpus with MaxSim scoring to find the most relevant video clips that match the query.
 
-## Model
+ The search demo is built around two files:
+- `embed.py`: Offline embedding pipeline
+- `search_server.py`: Online embedding + retrieval
 
-The model powering our search is **Qwen3-VL-Embedding-8B** (released January 2026), currently ranked #1 on MMEB for M-RET and #2 for V-RET. It represents a significant leap over earlier video embedding models — roughly 20 points ahead of the prior generation (e.g. VLM2Vec, released July 2025) on both tasks.
+### 1) Build the embedding corpus (`embed.py`)
 
-**Qwen3-VL-Embedding-2B** is also a strong option: only 3–5 points lower on M/V-RET benchmarks, but substantially smaller and faster — a good trade-off for demo-scale workloads.
+`embed.py` prepares data and writes token-level embeddings to parquet files.
 
-## Dataset
+At a high level it:
 
-This example uses the **[AIST Dance Video Database](https://aistdancedb.ongaaccel.jp/)** — a publicly available academic dataset of street dance videos paired with copyright-cleared music.
+- downloads and filters AIST clip URLs
+- embeds each video with `TomoroAI/tomoro-colqwen3-embed-4b`
+- stores one row per token embedding (`url`, `token_index`, `embedding`)
+- uploads parquet shards to a Modal Volume
 
-Key details:
-- **10 dance genres** including basic, advanced, cypher, battle, showcase, and group styles
-- **40 professional dancers** performing solo and group routines
-- **Multi-camera recordings** with up to 9 simultaneous camera angles per performance
-- Both refined (edited) and raw video versions available
-- ~515 GB total; subsets can be downloaded via filtered search
-- Free to use for research with attribution (cite Tsuchida et al., ISMIR 2019)
+This creates a multi-vector index where each video is represented by many token vectors, not a single pooled vector.
 
-For simplicity, this example uses only the basic and advanced clips from the front camera view (c01). This reduced corpus contains ~1,400 clips and is a natural fit for V-RET — searching across clips with text queries like "two dancers doing footwork" or even using a video of yourself dancing as a query to find similar clips.
+### 2) Serve retrieval (`search_server.py`)
 
-## Why Modal
+`search_server.py` loads the parquet shards at startup, reconstructs per-video token spans,
+and serves `/search`.
 
-- GPU-accelerated embedding inference at scale
-- Serverless architecture — embed a large video corpus without managing infrastructure
-- Pairs naturally with Modal Volumes for storing embeddings and video data
-- Fast iteration between CPU (search/retrieval) and GPU (embedding) workloads
+For each text query it:
 
-## Query inference server
+- gets query token embeddings from vLLM pooling
+- computes token-to-token similarities against all corpus token embeddings
+- applies MaxSim scoring per video:
+  - max over each video's token set per query token
+  - sum those maxima across query tokens
+- returns the best matching video URL + score
 
-`query_inference_server.py` is a standalone embedding service.
+This is the core multivector late-interaction retrieval loop.
 
-It starts `vllm serve` with the pooling runner and exposes one endpoint:
+## Run Demo
 
-- `POST /embed`
-- input payload has a required `type` field: `text`, `image`, or `video`
-- output is always token-level multi-vector embeddings under `embedding`
-
-Run it:
+1. Kick off pipeline to create and store embeddings:
 
 ```bash
-modal serve query_inference_server.py
+modal run --detach embed.py
 ```
 
-Deploy it:
+2. After embedding completes, deploy the search service:
+
+```bash
+modal deploy search_server.py
+```
+
+3. Call `/search` with a text query, using the search server's URL:
+
+```bash
+curl -X POST "$SEARCH_URL/search" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "text",
+    "text": "A video of a dancer spinning like a ballerina"
+  }'
+```
+
+## Dataset Notes
+
+The demo uses AIST street dance clips (focused subset) to keep iteration practical while still showing realistic cross-modal retrieval behavior.
+
+## Minimal Production Building Blocks
+
+Alongside the demo pipeline, this repo includes a stripped-down deployment path for generic inference workloads. This makes use of Modal's "Flash" experimental.http_server, which enables lower input overhead and is optimal for low-latency inference use cases.
+
+### `query_inference_server.py`
+
+`query_inference_server.py` is a minimal Modal wrapper around `vllm serve`
+using `modal.experimental.http_server`.
+
+It exposes vLLM's native pooling endpoint directly, so clients send requests
+to `$SERVER_URL$/pooling` with modality-specific payloads.
+
+### `query_inference_client.py`
+
+`query_inference_client.py` is a lightweight Python client with convenience methods for text, image, and video embedding.
+
+It handles request formatting internally, so callers can work with simple
+method calls rather than assembling multimodal request payloads by hand.
+
+## Run Production Template
+
+1. Deploy the inference server:
 
 ```bash
 modal deploy query_inference_server.py
 ```
 
-### Local request examples
+2. Copy the app URL (the one ending in `.modal.direct`).
 
-Text:
-
-```bash
-curl -X POST "$URL/embed" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "text",
-    "text": "two dancers doing synchronized footwork"
-  }'
-```
-
-Image:
+3. Run the sample client against that URL:
 
 ```bash
-curl -X POST "$URL/embed" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "image",
-    "image_url": "https://example.com/frame.jpg"
-  }'
-```
-
-Video:
-
-```bash
-curl -X POST "$URL/embed" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "video",
-    "video_url": "https://example.com/clip.mp4"
-  }'
+INFERENCE_BASE_URL=<url> python query_inference_client.py
 ```
