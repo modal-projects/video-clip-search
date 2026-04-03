@@ -4,19 +4,20 @@ This repository demonstrates end-to-end video retrieval on Modal using the
 `TomoroAI/tomoro-colqwen3-embed-4b` multi-vector embedding model.
 
 The demo indexes clips from the [AIST Dance Video Database](https://aistdancedb.ongaaccel.jp/)
-and serves text-to-video search with ColBERT-style MaxSim scoring.
+and serves text-to-video search with multi-vector MaxSim scoring.
 
 ## Demo Overview
 
-This demo showcases an example multimodal retrieval, where one can query a corpus of clips of street dance video clips with text descriptions as queries. Text queries are embedded with TomoroAI/tomoro-colqwen3-embed-4b, and search is performed across the 4200 clip corpus with MaxSim scoring to find the most relevant video clips that match the query.
+This demo showcases an example multimodal retrieval, querying a corpus of clips of street dance video clips with text descriptions as queries. Text queries are embedded with TomoroAI/tomoro-colqwen3-embed-4b, and search is performed across the 4200 clip corpus with MaxSim scoring to find the most relevant video clips that match the query.
 
  The search demo is built around two files:
-- `embed.py`: Offline embedding pipeline
-- `search_server.py`: Online embedding + retrieval
+- `embed.py`: builds the embedding corpus
+- `search_server.py`: serves retrieval over stored embeddings
 
 ### 1) Build the embedding corpus (`embed.py`)
 
-`embed.py` prepares data and writes token-level embeddings to parquet files.
+`embed.py` downloads and filters AIST clip URLs, embeds each video, and writes
+parquet shards to a Modal Volume.
 
 At a high level it:
 
@@ -82,7 +83,7 @@ Alongside the demo pipeline, this repo includes a stripped-down deployment path 
 using `modal.experimental.http_server`.
 
 It exposes vLLM's native pooling endpoint directly, so clients send requests
-to `$SERVER_URL$/pooling` with modality-specific payloads.
+to `$SERVER_URL/pooling` with modality-specific payloads.
 
 ### `query_inference_client.py`
 

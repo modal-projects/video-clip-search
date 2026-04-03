@@ -57,7 +57,7 @@ def wait_for_vllm_server():
 
 
 @app.cls(
-    gpu="L40S", # or try H100 for lower latency and handling higher concurrency
+    gpu="L40S",  # or try H100 for lower latency and handling higher concurrency
     image=vllm_image,
     volumes={
         "/root/.cache/huggingface": hf_cache_vol,
