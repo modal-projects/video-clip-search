@@ -69,7 +69,7 @@ curl -X POST "$SEARCH_URL/search" \
   }'
 ```
 
-<video src="./assets/video_search_demo.mov" controls muted playsinline width="100%"></video>
+<video src="./assets/video_search_demo.mp4" controls muted playsinline width="100%"></video>
 
 
 
