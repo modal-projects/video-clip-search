@@ -96,7 +96,7 @@ if __name__ == "__main__":
     )
 
     text_result = client.embed_text(
-        "A video of adancer spinning around like a ballerina"
+        "A video of a dancer spinning around like a ballerina"
     )
     print(
         f"Multi vector text embedding: {text_result['embedding']}, total tokens: {text_result['total_tokens']}"

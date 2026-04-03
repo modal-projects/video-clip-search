@@ -4,7 +4,7 @@ This repository demonstrates end-to-end video retrieval on Modal using the
 `TomoroAI/tomoro-colqwen3-embed-4b` multi-vector embedding model.
 
 The demo indexes clips from the [AIST Dance Video Database](https://aistdancedb.ongaaccel.jp/)
-and serves text-to-video search with multi-vector MaxSim scoring.
+and serves text-to-video search with multi-vector MaxSim scoring. 
 
 ## Demo Overview
 
@@ -69,9 +69,9 @@ curl -X POST "$SEARCH_URL/search" \
   }'
 ```
 
-## Dataset Notes
+<video src="./assets/video_search_demo.mov" controls muted playsinline width="100%"></video>
 
-The demo uses AIST street dance clips (focused subset) to keep iteration practical while still showing realistic cross-modal retrieval behavior.
+
 
 ## Minimal Production Building Blocks
 
