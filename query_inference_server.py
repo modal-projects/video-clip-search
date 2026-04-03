@@ -57,7 +57,7 @@ def wait_for_vllm_server():
 
 
 @app.cls(
-    gpu="L40S",
+    gpu="L40S", # or try H100 for lower latency and handling higher concurrency
     image=vllm_image,
     volumes={
         "/root/.cache/huggingface": hf_cache_vol,
@@ -68,7 +68,7 @@ def wait_for_vllm_server():
     min_containers=1,
     max_containers=5,
 )
-@modal.concurrent(target_inputs=8)
+@modal.concurrent(target_inputs=5)
 @modal.experimental.http_server(port=VLLM_PORT, proxy_regions=["eu-west"])
 class QueryInferenceServer:
     @modal.enter()

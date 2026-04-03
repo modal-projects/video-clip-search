@@ -36,7 +36,7 @@ class QueryInferenceClient:
         embedding = self._extract_embedding(result)
         return {
             "embedding": embedding,
-            "total_token_embeddings": len(embedding),
+            "total_tokens": len(embedding),
         }
 
     def embed_image(self, image_url: str, timeout_s: int = 120) -> dict[str, Any]:
@@ -59,7 +59,7 @@ class QueryInferenceClient:
         embedding = self._extract_embedding(result)
         return {
             "embedding": embedding,
-            "total_token_embeddings": len(embedding),
+            "total_tokens": len(embedding),
         }
 
     def embed_video(self, video_url: str, timeout_s: int = 300) -> dict[str, Any]:
@@ -82,7 +82,7 @@ class QueryInferenceClient:
         embedding = self._extract_embedding(result)
         return {
             "embedding": embedding,
-            "total_token_embeddings": len(embedding),
+            "total_tokens": len(embedding),
         }
 
 
@@ -99,7 +99,7 @@ if __name__ == "__main__":
         "A video of adancer spinning around like a ballerina"
     )
     print(
-        f"Multi vector text embedding: {text_result['embedding']}, total token embeddings: {text_result['total_token_embeddings']}"
+        f"Multi vector text embedding: {text_result['embedding']}, total tokens: {text_result['total_tokens']}"
     )
 
     # Example video embedding inference
