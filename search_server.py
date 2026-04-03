@@ -146,48 +146,14 @@ def video_search_server():
         if query_type == "text":
             text = query.get("text", "")
             if not text:
-                raise HTTPException(status_code=400, detail="text is required for type='text'")
+                raise HTTPException(
+                    status_code=400, detail="text is required for type='text'"
+                )
             payload = {"model": MODEL_NAME, "input": [text]}
-        elif query_type == "image":
-            image_url = query.get("image_url", "")
-            if not image_url:
-                raise HTTPException(
-                    status_code=400, detail="image_url is required for type='image'"
-                )
-            payload = {
-                "model": MODEL_NAME,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": image_url}},
-                            {"type": "text", "text": "Represent this image."},
-                        ],
-                    }
-                ],
-            }
-        elif query_type == "video":
-            video_url = query.get("video_url", "")
-            if not video_url:
-                raise HTTPException(
-                    status_code=400, detail="video_url is required for type='video'"
-                )
-            payload = {
-                "model": MODEL_NAME,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "video_url", "video_url": {"url": video_url}},
-                            {"type": "text", "text": "Represent this video."},
-                        ],
-                    }
-                ],
-            }
         else:
             raise HTTPException(
                 status_code=400,
-                detail="type must be one of: text, image, video",
+                detail="Search demo only supports text queries.",
             )
 
         response = requests.post(
@@ -208,7 +174,6 @@ def video_search_server():
         query_vecs = cp.array(query_embedding, dtype=cp.float32)  # (M, 320)
 
         # MaxSim scoring: for each query token, find max similarity with any doc token, then sum
-        # Single large GEMM for all pairwise token similarities
         sim_matrix = query_vecs @ all_embeddings.T  # (M, total_tokens)
 
         # Score each document by slicing its token columns

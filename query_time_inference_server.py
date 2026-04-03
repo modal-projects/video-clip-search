@@ -60,7 +60,9 @@ def create_inference_payload(req: dict) -> dict:
     if query_type == "text":
         text = req.get("text", "")
         if not text:
-            raise HTTPException(status_code=400, detail="text is required for type='text'")
+            raise HTTPException(
+                status_code=400, detail="text is required for type='text'"
+            )
         return {"model": MODEL_NAME, "input": [text]}
 
     if query_type == "image":
@@ -101,7 +103,9 @@ def create_inference_payload(req: dict) -> dict:
             ],
         }
 
-    raise HTTPException(status_code=400, detail="type must be one of: text, image, video")
+    raise HTTPException(
+        status_code=400, detail="type must be one of: text, image, video"
+    )
 
 
 @app.function(
