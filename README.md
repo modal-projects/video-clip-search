@@ -19,14 +19,13 @@ This demo showcases an example multimodal retrieval, querying a corpus of clips 
 `embed.py` downloads and filters AIST clip URLs, embeds each video, and writes
 parquet shards to a Modal Volume.
 
-At a high level it:
+At a high level:
+- Downloads AIST video clips to a Modal Volume
+- Embeds each video clip with `TomoroAI/tomoro-colqwen3-embed-4b`
+- Stores one row per token embedding (`url`, `token_index`, `embedding`)
+- Uploads embeddings stored in .parquet files to a Modal Volume
 
-- downloads and filters AIST clip URLs
-- embeds each video with `TomoroAI/tomoro-colqwen3-embed-4b`
-- stores one row per token embedding (`url`, `token_index`, `embedding`)
-- uploads parquet shards to a Modal Volume
-
-This creates a multi-vector index where each video is represented by many token vectors, not a single pooled vector.
+This creates a multi-vector index where each video is represented by many token vectors.
 
 ### 2) Serve retrieval (`search_server.py`)
 
