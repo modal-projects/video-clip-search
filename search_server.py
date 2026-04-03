@@ -165,10 +165,11 @@ def video_search_server():
 
     def compute_maxsim_scores(query_embedding: list[list[float]]) -> "cp.ndarray":
         # One matrix multiplication computes all query-token vs corpus-token similarities.
+        # At larger scales, a vector database query is optimal.
         query_vecs = cp.array(
             query_embedding, dtype=cp.float32
         )  # (Q query tokens, 320)
-        sim_matrix = query_vecs @ all_embeddings.T  # (Q, total_tokens)
+        sim_matrix = query_vecs @ all_embeddings.T  # (Q, N corpus embeddings)
 
         # For each document: max over doc tokens per query token, then sum.
         scores = cp.empty(len(doc_offsets), dtype=cp.float32)
