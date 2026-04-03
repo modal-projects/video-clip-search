@@ -163,6 +163,19 @@ def video_search_server():
         response.raise_for_status()
         return response.json()["data"][0]["data"]
 
+    def compute_maxsim_scores(query_embedding: list[list[float]]) -> "cp.ndarray":
+        # One matrix multiplication computes all query-token vs corpus-token similarities.
+        query_vecs = cp.array(
+            query_embedding, dtype=cp.float32
+        )  # (Q query tokens, 320)
+        sim_matrix = query_vecs @ all_embeddings.T  # (Q, total_tokens)
+
+        # For each document: max over doc tokens per query token, then sum.
+        scores = cp.empty(len(doc_offsets), dtype=cp.float32)
+        for i, (start, end) in enumerate(doc_offsets):
+            scores[i] = sim_matrix[:, start:end].max(axis=1).sum()
+        return scores
+
     get_query_embedding({"type": "text", "text": "warm up"})
 
     api_server = FastAPI()
@@ -171,15 +184,7 @@ def video_search_server():
     async def search(request: Request):
         query = await request.json()
         query_embedding = get_query_embedding(query)
-        query_vecs = cp.array(query_embedding, dtype=cp.float32)  # (M, 320)
-
-        # MaxSim scoring: for each query token, find max similarity with any doc token, then sum
-        sim_matrix = query_vecs @ all_embeddings.T  # (M, total_tokens)
-
-        # Score each document by slicing its token columns
-        scores = cp.empty(len(doc_offsets), dtype=cp.float32)
-        for i, (start, end) in enumerate(doc_offsets):
-            scores[i] = sim_matrix[:, start:end].max(axis=1).sum()
+        scores = compute_maxsim_scores(query_embedding)
 
         best_idx = int(cp.argmax(scores))
 
