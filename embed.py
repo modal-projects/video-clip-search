@@ -288,7 +288,9 @@ class Embedder:
             vision_kwargs["image_patch_size"] = image_patch_size
 
         # decode video frames into tensors
-        _, video_inputs, video_kwargs = self._process_video_inputs(messages, **vision_kwargs)
+        _, video_inputs, video_kwargs = self._process_video_inputs(
+            messages, **vision_kwargs
+        )
         if not video_inputs:
             raise ValueError(
                 f"process_video_inputs returned no video inputs for {video_path}"
@@ -502,7 +504,9 @@ class Embedder:
         # Create parquet rows: one row per token embedding per video (multi-vector)
         rows = []
         for url, output in zip(video_urls, outputs):
-            token_embeddings = output.outputs.data  # 2D: (num_visual_tokens, embedding_dim)
+            token_embeddings = (
+                output.outputs.data
+            )  # 2D: (num_visual_tokens, embedding_dim)
             for token_idx, token_vec in enumerate(token_embeddings):
                 rows.append(
                     {
@@ -603,5 +607,3 @@ def prep_dataset():
         logger.info(f"Uploaded {len(camera_view_clips_df)} clips to volume")
     else:
         logger.info(f"Clip list {CLIPS_FILE_NAME} already exists in volume")
-
-
