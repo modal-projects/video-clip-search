@@ -30,6 +30,7 @@ MINUTES = 60
 NUM_NVDEC_UNITS = 4  # For RTX-PRO-6000
 # cpu threads per gpu video decoding task
 TORCHCODEC_NUM_THREADS = 2
+MAX_NUM_VISUAL_TOKENS = 5120
 
 # ---------------------------------------------------------------------------
 # Images & Volumes
@@ -48,11 +49,11 @@ with downloader_image.imports():
     import requests
 
 vllm_image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.13")
+    modal.Image.from_registry("nvidia/cuda:12.9.0-devel-ubuntu22.04", add_python="3.13")
     .entrypoint([])
     .apt_install("ffmpeg")
     .uv_pip_install(
-        "vllm==0.16.0",
+        "vllm==0.17.0",
         "huggingface-hub==0.36.0",
         "qwen-vl-utils==0.0.14",
         "pandas==3.0.1",
@@ -60,9 +61,9 @@ vllm_image = (
         "pyarrow==23.0.1",
     )
     .run_commands(
-        "pip install torchcodec==0.9.0 --index-url=https://download.pytorch.org/whl/cu128"
+        "pip install torchcodec==0.10.0 --index-url=https://download.pytorch.org/whl/cu129"
     )
-    .uv_pip_install("torch==2.9.0", "torchvision==0.24.0", "torchaudio==2.9.0")
+    .uv_pip_install("torch==2.10.0", "torchvision==0.25.0", "torchaudio==2.10.0")
     .env(
         {
             "HF_XET_HIGH_PERFORMANCE": "1",
@@ -74,6 +75,17 @@ vllm_image = (
 with vllm_image.imports():
     from vllm import LLM, EngineArgs
     import torch
+    from qwen_vl_utils.vision_process import (
+        FRAME_FACTOR,
+        MODEL_SEQ_LEN,
+        SPATIAL_MERGE_SIZE,
+        VIDEO_MAX_TOKEN_NUM,
+        VIDEO_MIN_TOKEN_NUM,
+        calculate_video_frame_range,
+        extract_vision_info,
+        smart_nframes,
+        smart_resize,
+    )
     from torchcodec.decoders import VideoDecoder
     from torchvision import transforms
     from torchvision.transforms import InterpolationMode
@@ -94,7 +106,9 @@ with orchestrator_image.imports():
 # Volume to store video clips
 clips_vol = modal.Volume.from_name("video-clips", create_if_missing=True)
 # Volume to store video embeddings
-embedding_store_vol = modal.Volume.from_name("video-embeddings", create_if_missing=True)
+embedding_store_vol = modal.Volume.from_name(
+    "colqwen3-video-embeddings", create_if_missing=True
+)
 # Volume for Hugging Face cache of model weights
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 # Volume for vLLM cache
@@ -170,7 +184,7 @@ def download_clip_batch(clip_urls: list[str], batch_index: int):
     volumes={CLIPS_DIR: clips_vol},
     timeout=30 * MINUTES,
 )
-@modal.concurrent(target_inputs=8)
+@modal.concurrent(target_inputs=8, max_inputs=16)
 def download_clip(clip_url: str) -> str:
     """Downloads a clip to a volume"""
     from pathlib import Path
@@ -217,7 +231,7 @@ class Embedder:
 
         logger.info("Loading vLLM embedding model...")
         engine_args = EngineArgs(
-            model="Qwen/Qwen3-VL-Embedding-8B",
+            model="TomoroAI/tomoro-colqwen3-embed-4b",
             runner="pooling",
             dtype="bfloat16",
             trust_remote_code=True,
@@ -228,8 +242,17 @@ class Embedder:
         self.llm = LLM(**vars(engine_args))
         self.processor = self.llm.llm_engine.tokenizer
 
-        # Warm up
-        self.llm.embed([{"prompt": "warm up", "multi_modal_data": None}])
+        # Set max number of visual tokens per video input, per model card guidance
+        setattr(self.processor, "max_num_visual_tokens", MAX_NUM_VISUAL_TOKENS)
+        image_processor = getattr(self.processor, "image_processor", None)
+        if image_processor is not None:
+            setattr(image_processor, "max_num_visual_tokens", MAX_NUM_VISUAL_TOKENS)
+
+        # Warm up model
+        warump_prompt = ["warm up text input"]
+        for _ in range(3):
+            self.llm.encode(warump_prompt, pooling_task="token_embed")
+
         logger.info("vLLM embedding model ready")
 
     def _prepare_video_inputs(self, video_path: str, vision_kwargs: dict) -> dict:
@@ -265,7 +288,9 @@ class Embedder:
             vision_kwargs["image_patch_size"] = image_patch_size
 
         # decode video frames into tensors
-        _, video_inputs, video_kwargs = process_video_inputs(messages, **vision_kwargs)
+        _, video_inputs, video_kwargs = self._process_video_inputs(
+            messages, **vision_kwargs
+        )
         if not video_inputs:
             raise ValueError(
                 f"process_video_inputs returned no video inputs for {video_path}"
@@ -281,6 +306,159 @@ class Embedder:
             "multi_modal_data": mm_data,
             "mm_processor_kwargs": video_kwargs,
         }
+
+    def _read_video_torchcodec(
+        self,
+        ele: Dict[str, Any],
+        num_ffmpeg_threads: int = 4,
+    ) -> Tuple["torch.Tensor", dict, float]:
+        """Read video using torchcodec, preferring CUDA decode when supported."""
+        video_path = ele["video"]
+        st = time.time()
+        decode_device = "cuda" if torch.cuda.is_available() else "cpu"
+        try:
+            decoder = VideoDecoder(
+                video_path, num_ffmpeg_threads=num_ffmpeg_threads, device="cuda"
+            )
+        except RuntimeError as err:
+            # Torch can report CUDA available while torchcodec/ffmpeg lacks CUDA decode support.
+            if "Unsupported device: cuda" not in str(err):
+                raise
+            decode_device = "cpu"
+            logger.warning(
+                "torchcodec cuda decode unavailable; falling back to cpu decode "
+                f"for {video_path}: {err}"
+            )
+            decoder = VideoDecoder(video_path, num_ffmpeg_threads=num_ffmpeg_threads)
+
+        video_fps = decoder.metadata.average_fps
+        total_frames = decoder.metadata.num_frames
+        start_frame, end_frame, total_frames = calculate_video_frame_range(
+            ele, total_frames, video_fps
+        )
+        nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
+        idx = torch.linspace(start_frame, end_frame, nframes).round().long().tolist()
+        sample_fps = nframes / max(total_frames, 1e-6) * video_fps
+        video = decoder.get_frames_at(indices=idx).data
+        logger.info(
+            f"torchcodec decode {decode_device}: {video_path=}, {total_frames=}, {video_fps=}, "
+            f"time={time.time() - st:.3f}s"
+        )
+
+        video_metadata = dict(
+            fps=video_fps,
+            frames_indices=idx,
+            total_num_frames=total_frames,
+            video_backend=f"torchcodec-{decode_device}",
+        )
+        return video, video_metadata, sample_fps
+
+    def _fetch_and_decode_video(
+        self,
+        ele: Dict[str, Any],
+        image_patch_size: int = 14,
+        return_video_sample_fps: bool = False,
+        return_video_metadata: bool = False,
+    ) -> Union["torch.Tensor", Tuple]:
+        """Fetch and preprocess a video, using GPU torchcodec decoding."""
+        # QwenVL series specific video frame tokenization parameters
+        image_factor = image_patch_size * SPATIAL_MERGE_SIZE
+        video_frame_min_pixels = VIDEO_MIN_TOKEN_NUM * image_factor * image_factor
+        video_frame_max_pixels = VIDEO_MAX_TOKEN_NUM * image_factor * image_factor
+
+        if not isinstance(ele.get("video"), str):
+            raise ValueError("video input must be a string path or URL")
+
+        # number of cpu threads per gpu video decoding task
+        num_ffmpeg_threads = int(os.environ.get("TORCHCODEC_NUM_THREADS", 4))
+        video, video_metadata, sample_fps = self._read_video_torchcodec(
+            ele, num_ffmpeg_threads=num_ffmpeg_threads
+        )
+        # return video to cpu
+        video = video.to("cpu")
+
+        nframes, _, height, width = video.shape
+        min_pixels = ele.get("min_pixels", video_frame_min_pixels)
+        total_pixels = ele.get(
+            "total_pixels", MODEL_SEQ_LEN * image_factor * image_factor * 0.9
+        )
+        max_pixels = max(
+            min(video_frame_max_pixels, total_pixels / nframes * FRAME_FACTOR),
+            int(min_pixels * 1.05),
+        )
+        max_pixels_supposed = ele.get("max_pixels", max_pixels)
+        if max_pixels_supposed > max_pixels:
+            logger.warning(
+                f"The given max_pixels[{max_pixels_supposed}] exceeds limit[{max_pixels}]."
+            )
+        max_pixels = min(max_pixels_supposed, max_pixels)
+
+        if "resized_height" in ele and "resized_width" in ele:
+            resized_height, resized_width = smart_resize(
+                ele["resized_height"], ele["resized_width"], factor=image_factor
+            )
+        else:
+            resized_height, resized_width = smart_resize(
+                height,
+                width,
+                factor=image_factor,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+            )
+
+        video = transforms.functional.resize(
+            video,
+            [resized_height, resized_width],
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
+        ).float()
+
+        final_video = (video, video_metadata) if return_video_metadata else video
+        if return_video_sample_fps:
+            return final_video, sample_fps
+        return final_video
+
+    def _process_video_inputs(
+        self,
+        conversations: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]],
+        return_video_kwargs: bool = False,
+        return_video_metadata: bool = False,
+        image_patch_size: int = 14,
+    ) -> Tuple[
+        Optional[List],
+        Optional[List["torch.Tensor"]],
+        Optional[Dict[str, Any]],
+    ]:
+        """Process video-only vision info from conversations using GPU decoding."""
+        # Get video inputs from conversations
+        vision_infos = extract_vision_info(conversations)
+
+        video_inputs = []
+        video_sample_fps_list = []
+
+        for vision_info in vision_infos:
+            if "video" not in vision_info:
+                raise ValueError("Expected video input type")
+
+            video_input, video_sample_fps = self._fetch_and_decode_video(
+                vision_info,
+                return_video_sample_fps=True,
+                image_patch_size=image_patch_size,
+                return_video_metadata=return_video_metadata,
+            )
+            video_sample_fps_list.append(video_sample_fps)
+            video_inputs.append(video_input)
+
+        if len(video_inputs) == 0:
+            video_inputs = None
+
+        video_kwargs = {"do_sample_frames": False}
+        if not return_video_metadata:
+            video_kwargs.update({"fps": video_sample_fps_list})
+
+        if return_video_kwargs:
+            return None, video_inputs, video_kwargs
+        return None, video_inputs
 
     @modal.method()
     def embed_batch(
@@ -300,11 +478,14 @@ class Embedder:
 
         process_start = time.time()
         video_paths = [str(Path(CLIPS_DIR) / filename) for filename in video_filenames]
-        vision_kwargs = VISION_KWARGS.copy()
-
         with ThreadPoolExecutor(max_workers=NUM_NVDEC_UNITS) as pool:
             vllm_inputs = list(
-                pool.map(self._prepare_video_inputs, video_paths, vision_kwargs)
+                pool.map(
+                    lambda video_path: self._prepare_video_inputs(
+                        video_path, VISION_KWARGS.copy()
+                    ),
+                    video_paths,
+                )
             )
 
         process_duration_s = time.time() - process_start
@@ -313,17 +494,27 @@ class Embedder:
         )
 
         embed_start = time.time()
-        outputs = self.llm.embed(vllm_inputs)
+        outputs = self.llm.encode(vllm_inputs, pooling_task="token_embed")
         duration_s = time.time() - embed_start
 
         logger.info(
             f"Batch {batch_index}: embedded {len(vllm_inputs)} videos in {int(duration_s)}s"
         )
 
-        # Create parquet rows with columns "url" and "embedding"
+        # Create parquet rows: one row per token embedding per video (multi-vector)
         rows = []
         for url, output in zip(video_urls, outputs):
-            rows.append({"url": url, "embedding": output.outputs.embedding})
+            token_embeddings = (
+                output.outputs.data
+            )  # 2D: (num_visual_tokens, embedding_dim)
+            for token_idx, token_vec in enumerate(token_embeddings):
+                rows.append(
+                    {
+                        "url": url,
+                        "token_index": token_idx,
+                        "embedding": token_vec.tolist(),
+                    }
+                )
 
         df = pd.DataFrame(rows)
         buf = BytesIO()
@@ -334,6 +525,7 @@ class Embedder:
         with embedding_store_vol.batch_upload() as batch:
             batch.put_file(buf, f"embeddings_{batch_index}.parquet")
         embedding_store_vol.commit()
+        # Optionally, write embeddings to a vector database here
         logger.info(f"Saved embeddings for batch {batch_index}")
 
     @modal.exit()
@@ -415,194 +607,3 @@ def prep_dataset():
         logger.info(f"Uploaded {len(camera_view_clips_df)} clips to volume")
     else:
         logger.info(f"Clip list {CLIPS_FILE_NAME} already exists in volume")
-
-
-"""
-Video processing utilities with GPU-accelerated torchcodec decoding.
-
-Mirrors qwen_vl_utils.process_vision_info but creates
-torchcodec.VideoDecoder(device='cuda') for on-GPU video decoding.
-"""
-
-
-from qwen_vl_utils.vision_process import (
-    FRAME_FACTOR,
-    MODEL_SEQ_LEN,
-    SPATIAL_MERGE_SIZE,
-    VIDEO_MAX_TOKEN_NUM,
-    VIDEO_MIN_TOKEN_NUM,
-    calculate_video_frame_range,
-    extract_vision_info,
-    smart_nframes,
-    smart_resize,
-)
-
-
-# ---------------------------------------------------------------------------
-# GPU torchcodec reader
-# ---------------------------------------------------------------------------
-
-
-def _read_video_torchcodec(
-    ele: Dict[str, Any],
-    num_ffmpeg_threads: int = 4,
-) -> Tuple["torch.Tensor", dict, float]:
-    """Read video using torchcodec, preferring CUDA decode when supported."""
-
-    video_path = ele["video"]
-    st = time.time()
-    decode_device = "cuda" if torch.cuda.is_available() else "cpu"
-    try:
-        decoder = VideoDecoder(
-            video_path, num_ffmpeg_threads=num_ffmpeg_threads, device="cuda"
-        )
-    except RuntimeError as err:
-        # Torch can report CUDA available while torchcodec/ffmpeg lacks CUDA decode support.
-        if "Unsupported device: cuda" not in str(err):
-            raise
-        decode_device = "cpu"
-        logger.warning(
-            "torchcodec cuda decode unavailable; falling back to cpu decode "
-            f"for {video_path}: {err}"
-        )
-        decoder = VideoDecoder(video_path, num_ffmpeg_threads=num_ffmpeg_threads)
-
-    video_fps = decoder.metadata.average_fps
-    total_frames = decoder.metadata.num_frames
-    start_frame, end_frame, total_frames = calculate_video_frame_range(
-        ele, total_frames, video_fps
-    )
-    nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
-    idx = torch.linspace(start_frame, end_frame, nframes).round().long().tolist()
-    sample_fps = nframes / max(total_frames, 1e-6) * video_fps
-    video = decoder.get_frames_at(indices=idx).data
-    logger.info(
-        f"torchcodec decode {decode_device}: {video_path=}, {total_frames=}, {video_fps=}, "
-        f"time={time.time() - st:.3f}s"
-    )
-
-    video_metadata = dict(
-        fps=video_fps,
-        frames_indices=idx,
-        total_num_frames=total_frames,
-        video_backend=f"torchcodec-{decode_device}",
-    )
-    return video, video_metadata, sample_fps
-
-
-# ---------------------------------------------------------------------------
-# fetch_video — same as qwen_vl_utils but wired to the GPU reader
-# ---------------------------------------------------------------------------
-
-
-def fetch_and_decode_video(
-    ele: Dict[str, Any],
-    image_patch_size: int = 14,
-    return_video_sample_fps: bool = False,
-    return_video_metadata: bool = False,
-) -> Union["torch.Tensor", Tuple]:
-    """Fetch and preprocess a video, using GPU torchcodec decoding."""
-
-    # QwenVL series specific video frame tokenization parameters
-    image_factor = image_patch_size * SPATIAL_MERGE_SIZE
-    video_frame_min_pixels = VIDEO_MIN_TOKEN_NUM * image_factor * image_factor
-    video_frame_max_pixels = VIDEO_MAX_TOKEN_NUM * image_factor * image_factor
-
-    if not isinstance(ele.get("video"), str):
-        raise ValueError("video input must be a string path or URL")
-
-    # number of cpu threads per gpu video decoding task
-    num_ffmpeg_threads = int(os.environ.get("TORCHCODEC_NUM_THREADS", 4))
-    video, video_metadata, sample_fps = _read_video_torchcodec(
-        ele, num_ffmpeg_threads=num_ffmpeg_threads
-    )
-    # return video to cpu
-    video = video.to("cpu")
-
-    nframes, _, height, width = video.shape
-    min_pixels = ele.get("min_pixels", video_frame_min_pixels)
-    total_pixels = ele.get(
-        "total_pixels", MODEL_SEQ_LEN * image_factor * image_factor * 0.9
-    )
-    max_pixels = max(
-        min(video_frame_max_pixels, total_pixels / nframes * FRAME_FACTOR),
-        int(min_pixels * 1.05),
-    )
-    max_pixels_supposed = ele.get("max_pixels", max_pixels)
-    if max_pixels_supposed > max_pixels:
-        logger.warning(
-            f"The given max_pixels[{max_pixels_supposed}] exceeds limit[{max_pixels}]."
-        )
-    max_pixels = min(max_pixels_supposed, max_pixels)
-
-    if "resized_height" in ele and "resized_width" in ele:
-        resized_height, resized_width = smart_resize(
-            ele["resized_height"], ele["resized_width"], factor=image_factor
-        )
-    else:
-        resized_height, resized_width = smart_resize(
-            height,
-            width,
-            factor=image_factor,
-            min_pixels=min_pixels,
-            max_pixels=max_pixels,
-        )
-
-    video = transforms.functional.resize(
-        video,
-        [resized_height, resized_width],
-        interpolation=InterpolationMode.BICUBIC,
-        antialias=True,
-    ).float()
-
-    final_video = (video, video_metadata) if return_video_metadata else video
-    if return_video_sample_fps:
-        return final_video, sample_fps
-    return final_video
-
-
-# ---------------------------------------------------------------------------
-# process_video_inputs — similar to qwen_vl_utils.process_vision_info but uses our GPU video decoding
-# ---------------------------------------------------------------------------
-
-
-def process_video_inputs(
-    conversations: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]],
-    return_video_kwargs: bool = False,
-    return_video_metadata: bool = False,
-    image_patch_size: int = 14,
-) -> Tuple[
-    Optional[List],
-    Optional[List["torch.Tensor"]],
-    Optional[Dict[str, Any]],
-]:
-    """Process video-only vision info from conversations using GPU decoding."""
-    # Get video inputs from conversations
-    vision_infos = extract_vision_info(conversations)
-
-    video_inputs = []
-    video_sample_fps_list = []
-
-    for vision_info in vision_infos:
-        if "video" not in vision_info:
-            raise ValueError("Expected video input type")
-
-        video_input, video_sample_fps = fetch_and_decode_video(
-            vision_info,
-            return_video_sample_fps=True,
-            image_patch_size=image_patch_size,
-            return_video_metadata=return_video_metadata,
-        )
-        video_sample_fps_list.append(video_sample_fps)
-        video_inputs.append(video_input)
-
-    if len(video_inputs) == 0:
-        video_inputs = None
-
-    video_kwargs = {"do_sample_frames": False}
-    if not return_video_metadata:
-        video_kwargs.update({"fps": video_sample_fps_list})
-
-    if return_video_kwargs:
-        return None, video_inputs, video_kwargs
-    return None, video_inputs

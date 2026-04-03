@@ -2,3 +2,4 @@
 bin
 *.csv
 __pycache__
+*.parquet
