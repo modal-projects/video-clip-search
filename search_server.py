@@ -44,7 +44,7 @@ vllm_image = (
 
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
-embedding_store_vol = modal.Volume.from_name("colqwen3-video-embeddings2")
+embedding_store_vol = modal.Volume.from_name("colqwen3-video-embeddings")
 
 with vllm_image.imports():
     import pandas as pd
