@@ -501,19 +501,12 @@ class Embedder:
             f"Batch {batch_index}: embedded {len(vllm_inputs)} videos in {int(duration_s)}s"
         )
 
-<<<<<<< HEAD
-        # Create parquet rows: one row per token embedding per video (multi-vector / ColBERT style)
-        rows = []
-        for url, output in zip(video_urls, outputs):
-            token_embeddings = output.outputs.data  # 2D: (num_tokens, embedding_dim)
-=======
         # Create parquet rows: one row per token embedding per video (multi-vector)
         rows = []
         for url, output in zip(video_urls, outputs):
             token_embeddings = (
                 output.outputs.data
             )  # 2D: (num_visual_tokens, embedding_dim)
->>>>>>> 95a6a163e03eb306c885aa8fd61c29a89f2f20a6
             for token_idx, token_vec in enumerate(token_embeddings):
                 rows.append(
                     {
