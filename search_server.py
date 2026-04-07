@@ -27,13 +27,15 @@ vllm_image = (
         "vllm==0.18.0",
         "huggingface-hub==0.36.0",
         "qwen-vl-utils==0.0.14",
-        "torchcodec==0.9.0",
         "fastapi==0.135.1",
         "pandas==3.0.1",
         "requests==2.32.3",
         "numpy==2.0.0",
         "pyarrow==23.0.1",
         "cupy-cuda12x==14.0.0",
+    )
+    .run_commands(
+        "pip install torchcodec==0.10.0 --index-url=https://download.pytorch.org/whl/cu129"
     )
     .env({"HF_XET_HIGH_PERFORMANCE": "1", "FORCE_QWENVL_VIDEO_READER": "torchcodec"})
 )
@@ -42,7 +44,7 @@ vllm_image = (
 
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
-embedding_store_vol = modal.Volume.from_name("colqwen3-video-embeddings2")
+embedding_store_vol = modal.Volume.from_name("colqwen3-video-embeddings")
 
 with vllm_image.imports():
     import pandas as pd
@@ -138,40 +140,52 @@ def video_search_server():
 
     wait_for_vllm_server()
 
-    def get_text_embedding(text: str) -> list[list[float]]:
+    def get_query_embedding(query: dict) -> list[list[float]]:
         """Returns multi-vector embedding: list of per-token vectors (num_tokens x 320)."""
+        query_type = str(query.get("type", "text")).lower()
+        if query_type == "text":
+            text = query.get("text", "")
+            if not text:
+                raise HTTPException(
+                    status_code=400, detail="text is required for type='text'"
+                )
+            payload = {"model": MODEL_NAME, "input": [text]}
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Search demo only supports text queries.",
+            )
+
         response = requests.post(
             f"http://localhost:{VLLM_PORT}/pooling",
-            json={
-                "model": MODEL_NAME,
-                "input": [text],
-            },
+            json=payload,
         )
         response.raise_for_status()
         return response.json()["data"][0]["data"]
 
-    get_text_embedding("warm up")
+    def compute_maxsim_scores(query_embedding: list[list[float]]) -> "cp.ndarray":
+        # One matrix multiplication computes all query-token vs corpus-token similarities.
+        # At larger scales, a vector database query is optimal.
+        query_vecs = cp.array(
+            query_embedding, dtype=cp.float32
+        )  # (Q query tokens, 320)
+        sim_matrix = query_vecs @ all_embeddings.T  # (Q, N corpus embeddings)
+
+        # For each document: max over doc tokens per query token, then sum.
+        scores = cp.empty(len(doc_offsets), dtype=cp.float32)
+        for i, (start, end) in enumerate(doc_offsets):
+            scores[i] = sim_matrix[:, start:end].max(axis=1).sum()
+        return scores
+
+    get_query_embedding({"type": "text", "text": "warm up"})
 
     api_server = FastAPI()
 
     @api_server.post("/search")
     async def search(request: Request):
         query = await request.json()
-        query_text = query.get("text", "")
-        if not query_text:
-            raise HTTPException(status_code=400, detail="Query text is required")
-
-        query_embedding = get_text_embedding(query_text)
-        query_vecs = cp.array(query_embedding, dtype=cp.float32)  # (M, 320)
-
-        # MaxSim scoring: for each query token, find max similarity with any doc token, then sum
-        # Single large GEMM for all pairwise token similarities
-        sim_matrix = query_vecs @ all_embeddings.T  # (M, total_tokens)
-
-        # Score each document by slicing its token columns
-        scores = cp.empty(len(doc_offsets), dtype=cp.float32)
-        for i, (start, end) in enumerate(doc_offsets):
-            scores[i] = sim_matrix[:, start:end].max(axis=1).sum()
+        query_embedding = get_query_embedding(query)
+        scores = compute_maxsim_scores(query_embedding)
 
         best_idx = int(cp.argmax(scores))
 
