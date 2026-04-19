@@ -40,6 +40,10 @@ vllm_image = (
 
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
+VOLUMES = {
+    "/root/.cache/huggingface": hf_cache_vol,
+    "/root/.cache/vllm": vllm_cache_vol,
+}
 
 
 def wait_for_vllm_server():
@@ -59,10 +63,7 @@ def wait_for_vllm_server():
 @app.cls(
     gpu="L40S",  # or try H100 for lower latency and handling higher concurrency
     image=vllm_image,
-    volumes={
-        "/root/.cache/huggingface": hf_cache_vol,
-        "/root/.cache/vllm": vllm_cache_vol,
-    },
+    volumes=VOLUMES,
     timeout=10 * MINUTES,
     scaledown_window=15 * MINUTES,
     min_containers=1,
@@ -71,7 +72,7 @@ def wait_for_vllm_server():
 @modal.concurrent(target_inputs=5)
 @modal.experimental.http_server(port=VLLM_PORT, proxy_regions=["eu-west"])
 class QueryInferenceServer:
-    @modal.enter()
+    @modal.enter(snap=True)
     def startup(self):
         model_name = "TomoroAI/tomoro-colqwen3-embed-4b"
         logger.info("Starting vLLM server")
