@@ -504,7 +504,7 @@ class Embedder:
         # Create parquet rows: one row per token embedding per video (multi-vector)
         rows = []
         for url, output in zip(video_urls, outputs):
-            token_embeddings = output.outputs.data
+            token_embeddings = output.outputs.data  # 2D: (num_tokens, embedding_dim)
             for token_idx, token_vec in enumerate(token_embeddings):
                 rows.append(
                     {
