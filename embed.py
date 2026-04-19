@@ -104,7 +104,7 @@ with orchestrator_image.imports():
 
 
 # Volume to store video clips
-clips_vol = modal.Volume.from_name("video-clips", create_if_missing=True)
+clips_vol = modal.Volume.from_name("video-search-demo-clips", create_if_missing=True)
 # Volume to store video embeddings
 embedding_store_vol = modal.Volume.from_name(
     "colqwen3-video-embeddings", create_if_missing=True
@@ -504,9 +504,7 @@ class Embedder:
         # Create parquet rows: one row per token embedding per video (multi-vector)
         rows = []
         for url, output in zip(video_urls, outputs):
-            token_embeddings = (
-                output.outputs.data
-            )  # 2D: (num_visual_tokens, embedding_dim)
+            token_embeddings = output.outputs.data  # 2D: (num_tokens, embedding_dim)
             for token_idx, token_vec in enumerate(token_embeddings):
                 rows.append(
                     {

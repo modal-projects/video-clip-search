@@ -60,7 +60,7 @@ VLLM_PORT = 8000
 
 
 @app.function(
-    gpu="A100-80GB",
+    gpu="H100",
     image=vllm_image,
     volumes={
         "/root/.cache/huggingface": hf_cache_vol,
@@ -129,7 +129,7 @@ def video_search_server():
             "--dtype",
             "bfloat16",
             "--gpu-memory-utilization",
-            "0.50",
+            "0.45",
             "--attention-backend",
             "flashinfer",
             "--host",
