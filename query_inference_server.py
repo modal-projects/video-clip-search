@@ -68,6 +68,8 @@ def wait_for_vllm_server():
     scaledown_window=15 * MINUTES,
     min_containers=1,
     max_containers=5,
+    enable_memory_snapshot=True,
+    experimental_options={"enable_gpu_snapshot": True},
 )
 @modal.concurrent(target_inputs=5)
 @modal.experimental.http_server(port=VLLM_PORT, proxy_regions=["eu-west"])
